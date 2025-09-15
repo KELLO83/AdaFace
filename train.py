@@ -14,10 +14,12 @@ from torch.cuda import amp
 import torchvision.transforms.v2 as v2
 
 import net
+from net import Backbone
 import head as head_lib
 from dataset.image_folder_dataset import CustomImageFolderDataset
 
 from utils.polynomialLRWarmup import PolynomialLRWarmup
+import logging
 
 def split_parameters(module: nn.Module) -> Tuple[list, list]:
     params_decay = []
@@ -40,15 +42,17 @@ def build_dataloaders(data_dir: str,
                       photo_aug: float,
                       swap_color: bool,
                       output_dir: str,
-                      img_size: int = 112) -> Tuple[DataLoader, DataLoader, int]:
+                      img_size: int = 112,
+                      seed: int = 42) -> Tuple[DataLoader, DataLoader, int]:
 
     # AdaFace normalization expects mean=0.5, std=0.5 on BGR-order images (dataset does BGR swap)
+
     train_transform = v2.Compose([
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
         v2.Resize((img_size, img_size)), 
         v2.TrivialAugmentWide(), 
-        v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         v2.RandomErasing(p=0.3, scale=(0.02, 0.15) , value=0), 
      ])
 
@@ -74,6 +78,7 @@ def build_dataloaders(data_dir: str,
     if val_split > 0.0:
         val_len = int(n_total * val_split)
         train_len = n_total - val_len
+        torch.manual_seed(seed)
         perm = torch.randperm(n_total).tolist()
         train_indices, val_indices = perm[:train_len], perm[train_len:]
 
@@ -92,7 +97,7 @@ def build_dataloaders(data_dir: str,
         val_transform = v2.Compose([
             v2.ToImage(), v2.ToDtype(torch.float32, scale=True),
             v2.Resize((img_size, img_size)),
-            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
         val_dataset = CustomImageFolderDataset(
@@ -129,18 +134,32 @@ def build_dataloaders(data_dir: str,
 
 def load_pretrained_backbone(model: nn.Module, ckpt_path: str):
     ckpt = torch.load(ckpt_path, map_location='cpu')
-    state = ckpt.get('state_dict', ckpt)
-    model_sd = model.state_dict()
 
-    filtered = {}
-    for k, v in state.items():
-        k2 = k[6:] if k.startswith('model.') else k
-        if k2 in model_sd and model_sd[k2].shape == v.shape:
-            filtered[k2] = v
+    load_result = model.load_state_dict({key.replace('model.', ''):val
+                                            for key,val in ckpt['state_dict'].items() if 'model.' in key},
+                                        strict=False)
+    
+    result = model.load_state_dict(load_result, strict=False)
+    logging.info(f"Loaded pretrained backbone from {ckpt_path}")
+    logging.info(f"Loaded keys: {len(load_result)} | Missing: {len(result.missing_keys)} | Unexpected: {len(result.unexpected_keys)}")
 
-    result = model.load_state_dict(filtered, strict=False)
-    print(f"Loaded pretrained backbone from {ckpt_path}")
-    print(f"Loaded keys: {len(filtered)} | Missing: {len(result.missing_keys)} | Unexpected: {len(result.unexpected_keys)}")
+
+def weight_freeze(model: nn.Module):
+
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+
+    for name , param in model.named_parameters():
+        if name.startswith('output_layer') or name.startswith('body.48.res_layer'):
+            param.requires_grad = True
+        
+    backbone_params = sum(p.numel() for p in model.parameters())
+    trainable_backbone_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info('==' * 30)
+    logging.info(f"Model total params: {backbone_params:,}")
+    logging.info(f"Model trainable params: {trainable_backbone_params:,}")
+    logging.info(f"traineable params percentage: {100 * trainable_backbone_params / backbone_params:.2f}%")
+    logging.info('==' * 30)
 
 
 def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device, scaler: amp.GradScaler, epoch_idx: int, total_epochs: int, use_amp: bool = True):
@@ -155,7 +174,7 @@ def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device
         labels = labels.to(device)
         optimizer.zero_grad(set_to_none=True)
 
-        with amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type=device.type):
             out = backbone(images)
             if isinstance(out, (tuple, list)):
                 embeddings, norms = out
@@ -169,6 +188,8 @@ def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+
+        
 
         running_loss += loss.item() * images.size(0)
         _, preds = torch.max(logits, 1)
@@ -195,7 +216,7 @@ def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = 
     for images, labels in loader:
         images = images.to(device)
         labels = labels.to(device)
-        with amp.autocast(enabled=use_amp):
+        with torch.no_grad():
             out = backbone(images)
             if isinstance(out, (tuple, list)):
                 embeddings, norms = out
@@ -214,16 +235,17 @@ def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = 
 
 def main():
     parser = argparse.ArgumentParser(description='AdaFace Training (ImageFolder)')
-    parser.add_argument('--data_dir', type=str, required=True, help='Path to dataset root or root/imgs with class folders')
+    parser.add_argument('--data_dir', type=str, default='/home/ubuntu/KOR_DATA/high_resolution_train_data_640', help='Path to dataset root or root/imgs with class folders')
     parser.add_argument('--output_dir', type=str, default='experiments/adaface_custom', help='Output directory')
-    parser.add_argument('--arch', type=str, default='ir_50', choices=['ir_18','ir_34','ir_50','ir_101','ir_se_50'], help='Backbone architecture')
-    parser.add_argument('--epochs', type=int, default=24)
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--arch', type=str, default='ir_101', choices=['ir_18','ir_34','ir_50','ir_101','ir_se_50'], help='Backbone architecture')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--num_workers', type=int, default=os.cpu_count())
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
-    parser.add_argument('--start_from_model_statedict', type=str, default='', help='Path to pretrained AdaFace ckpt')
+    parser.add_argument('--pretrained', action='store_true' , help='pretrained')
+    parser.add_argument('--pretrained_path', type=str, default='', help='Path to pretrained AdaFace ckpt')
     parser.add_argument('--save_all', action='store_true')
 
     # AdaFace head params
@@ -240,26 +262,14 @@ def main():
     parser.add_argument('--swap_color_channel', action='store_true')
 
     parser.add_argument('--img_size', type=int, default=112, help='Input image size (height and width)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
 
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     os.makedirs(args.output_dir, exist_ok=True)
+    torch.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Data
-    train_loader, val_loader, class_num = build_dataloaders(
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        val_split=args.val_split,
-        low_res_aug=args.low_res_augmentation_prob,
-        crop_aug=args.crop_augmentation_prob,
-        photo_aug=args.photometric_augmentation_prob,
-        swap_color=args.swap_color_channel,
-        output_dir=args.output_dir,
-        img_size=args.img_size,
-    )
-
     # Model + Head
     # build backbone with dynamic input size (supported: 112 or 224)
     assert args.img_size in [112, 224], 'img_size must be 112 or 224 to match backbone shapes'
@@ -278,8 +288,29 @@ def main():
         raise ValueError(f'Unsupported arch: {arch}')
 
     backbone = build_backbone_with_size(args.arch, args.img_size).to(device)
-    if args.start_from_model_statedict:
-        load_pretrained_backbone(backbone, args.start_from_model_statedict)
+    if args.pretrained :
+        if args.pretrained_path and os.path.isfile(args.pretrained_path):
+            load_pretrained_backbone(backbone, args.pretrained_path)
+        else:
+            print(f"{args.pretrained_path} is not a file. Starting from scratch.")
+
+    weight_freeze(backbone)
+
+    # Data
+    train_loader, val_loader, class_num = build_dataloaders(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        val_split=args.val_split,
+        low_res_aug=args.low_res_augmentation_prob,
+        crop_aug=args.crop_augmentation_prob,
+        photo_aug=args.photometric_augmentation_prob,
+        swap_color=args.swap_color_channel,
+        output_dir=args.output_dir,
+        img_size=args.img_size,
+        seed=args.seed,
+    )
+
 
     adaface_head = head_lib.build_head(
         head_type=args.head,
@@ -291,7 +322,8 @@ def main():
         s=args.s,
     ).to(device)
 
-    # Optimizer and scheduler (match train_val.py style)
+
+
     paras_wo_bn, paras_only_bn = split_parameters(backbone)
     optimizer = optim.AdamW([
         {'params': paras_wo_bn + [adaface_head.kernel], 'weight_decay': args.weight_decay},
@@ -306,7 +338,8 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     best_acc = 0.0
-    scaler = amp.GradScaler(enabled=(device.type == 'cuda'))
+    scaler = torch.amp.GradScaler()
+
     use_amp = device.type == 'cuda'
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(backbone, adaface_head, train_loader, criterion, optimizer, device, scaler, epoch, args.epochs, use_amp=use_amp)
@@ -330,6 +363,7 @@ def main():
         if val_loader is not None and val_acc > best_acc:
             best_acc = val_acc
             torch.save(state, os.path.join(args.output_dir, 'best.ckpt'))
+
 
 if __name__ == '__main__':
     main()
