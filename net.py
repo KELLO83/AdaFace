@@ -317,7 +317,6 @@ class Backbone(Module):
 
 
     def forward(self, x):
-        
         # current code only supports one extra image
         # it comes with a extra dimension for number of extra image. We will just squeeze it out for now
         x = self.input_layer(x)
@@ -325,10 +324,10 @@ class Backbone(Module):
         for idx, module in enumerate(self.body):
             x = module(x)
         x = self.output_layer(x)
-        return x
+
+        # return both normalized embedding and its norm
         norm = torch.norm(x, 2, 1, True)
         output = torch.div(x, norm)
-
         return output, norm
 
 
@@ -411,4 +410,3 @@ def IR_SE_200(input_size):
     model = Backbone(input_size, 200, 'ir_se')
 
     return model
-
