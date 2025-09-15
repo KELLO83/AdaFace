@@ -7,13 +7,24 @@ import cv2
 
 from .augmenter import Augmenter
 
+def cv2_loader(path):
+    """
+    Custom loader using OpenCV to read an image and convert it to an RGB PIL Image.
+    This is generally faster than the default PIL loader.
+    """
+    img = cv2.imread(path)
+    # Convert from BGR (OpenCV default) to RGB (PIL/torchvision default)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img)
+
+
 class CustomImageFolderDataset(datasets.ImageFolder):
 
     def __init__(self,
                  root,
                  transform=None,
                  target_transform=None,
-                 loader=datasets.folder.default_loader,
+                 loader=None,  # loader is now ignored, we use cv2_loader
                  is_valid_file=None,
                  low_res_augmentation_prob=0.0,
                  crop_augmentation_prob=0.0,
@@ -22,10 +33,11 @@ class CustomImageFolderDataset(datasets.ImageFolder):
                  output_dir='./',
                  ):
 
+        # We use our own faster loader, overriding the default
         super(CustomImageFolderDataset, self).__init__(root,
                                                        transform=transform,
                                                        target_transform=target_transform,
-                                                       loader=loader,
+                                                       loader=cv2_loader,
                                                        is_valid_file=is_valid_file)
         self.root = root
         self.augmenter = Augmenter(crop_augmentation_prob, photometric_augmentation_prob, low_res_augmentation_prob)
@@ -41,20 +53,12 @@ class CustomImageFolderDataset(datasets.ImageFolder):
             tuple: (sample, target) where target is class_index of the target class.
         """
         path, target = self.samples[index]
+        # self.loader is cv2_loader, which returns an RGB PIL Image
         sample = self.loader(path)
+        
         sample = Image.fromarray(np.asarray(sample)[:,:,::-1])
 
-        if self.swap_color_channel:
-            # swap RGB to BGR if sample is in RGB
-            # we need sample in BGR
-            sample = Image.fromarray(np.asarray(sample)[:,:,::-1])
-
         sample = self.augmenter.augment(sample)
-
-        sample_save_path = os.path.join(self.output_dir, 'training_samples', 'sample.jpg')
-        if not os.path.isfile(sample_save_path):
-            os.makedirs(os.path.dirname(sample_save_path), exist_ok=True)
-            cv2.imwrite(sample_save_path, np.array(sample))  # the result has to look okay (Not color swapped)
 
         if self.transform is not None:
             sample = self.transform(sample)

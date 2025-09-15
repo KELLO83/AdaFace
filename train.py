@@ -12,6 +12,10 @@ from torchvision import transforms
 from tqdm import tqdm
 from torch.cuda import amp
 import torchvision.transforms.v2 as v2
+import cv2
+import torchvision
+import numpy as np
+from torchvision.transforms import InterpolationMode as I
 
 import net
 from net import Backbone
@@ -51,9 +55,18 @@ def build_dataloaders(data_dir: str,
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
         v2.Resize((img_size, img_size)), 
-        v2.TrivialAugmentWide(), 
+        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
+        v2.RandomHorizontalFlip(p=0.5),
+         v2.RandomApply([v2.RandomAffine(
+                degrees=5,
+                translate=(0.02, 0.02),
+                scale=(0.95, 1.05),
+                shear=None,
+                interpolation=I.BILINEAR,
+                fill=0.5
+                )], p=0.1),
         v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        v2.RandomErasing(p=0.3, scale=(0.02, 0.15) , value=0), 
+        v2.RandomErasing(p=0.1, scale=(0.02, 0.10) , value=0), 
      ])
 
 
@@ -62,13 +75,14 @@ def build_dataloaders(data_dir: str,
     root = imgs_dir if os.path.isdir(imgs_dir) else data_dir
 
     # build a base dataset to determine classes and length
+    # Augmentation parameters are set to 0 here as it's only used for metadata.
     base_dataset = CustomImageFolderDataset(
         root=root,
         transform=None,
-        low_res_augmentation_prob=low_res_aug,
-        crop_augmentation_prob=crop_aug,
-        photometric_augmentation_prob=photo_aug,
-        swap_color_channel=swap_color,
+        low_res_augmentation_prob=0.0,
+        crop_augmentation_prob=0.0,
+        photometric_augmentation_prob=0.0,
+        swap_color_channel=False,  # Not used, but set to default for clarity
         output_dir=output_dir,
     )
 
@@ -146,19 +160,36 @@ def load_pretrained_backbone(model: nn.Module, ckpt_path: str):
 
 def weight_freeze(model: nn.Module):
 
-    for name, param in model.named_parameters():
+    for param in model.parameters():
         param.requires_grad = False
 
-    for name , param in model.named_parameters():
-        if name.startswith('output_layer') or name.startswith('body.48.res_layer'):
+    # Determine the index of the last block in the body
+    last_block_idx = -1
+    if hasattr(model, 'body') and isinstance(model.body, nn.Sequential):
+        last_block_idx = len(model.body) - 1
+    
+    unfrozen_layers = []
+
+    for name, param in model.named_parameters():
+        # Unfreeze the output layer
+        if name.startswith('output_layer'):
             param.requires_grad = True
+            if 'output_layer' not in unfrozen_layers:
+                unfrozen_layers.append('output_layer')
         
+        # Unfreeze the last block of the body
+        if last_block_idx != -1 and name.startswith(f'body.{last_block_idx}'):
+            param.requires_grad = True
+            if f'body.{last_block_idx}' not in unfrozen_layers:
+                unfrozen_layers.append(f'body.{last_block_idx}')
+
     backbone_params = sum(p.numel() for p in model.parameters())
     trainable_backbone_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info('==' * 30)
+    logging.info(f"Unfrozen layers: {', '.join(unfrozen_layers)}")
     logging.info(f"Model total params: {backbone_params:,}")
     logging.info(f"Model trainable params: {trainable_backbone_params:,}")
-    logging.info(f"traineable params percentage: {100 * trainable_backbone_params / backbone_params:.2f}%")
+    logging.info(f"Trainable params percentage: {100 * trainable_backbone_params / backbone_params:.2f}%")
     logging.info('==' * 30)
 
 
@@ -216,7 +247,7 @@ def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = 
     for images, labels in loader:
         images = images.to(device)
         labels = labels.to(device)
-        with torch.no_grad():
+        with torch.amp.autocast(device_type=device.type):
             out = backbone(images)
             if isinstance(out, (tuple, list)):
                 embeddings, norms = out
@@ -233,6 +264,41 @@ def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = 
     return running_loss / total, correct / total
 
 
+def data_check(loader: DataLoader, is_bgr: bool):
+    """
+    Visualizes a batch of images from the DataLoader to check augmentations.
+    """
+    logging.info("Fetching a batch of data to visualize...")
+    # Get one batch of images and labels
+
+    
+    it = iter(loader)
+
+    # Make a grid of images for easy visualization
+    for images, labels in it:
+        grid = torchvision.utils.make_grid(images, nrow=8)
+
+        # Un-normalize from [-1, 1] range back to [0, 1] range
+        grid = grid * 0.5 + 0.5
+        grid = torch.clamp(grid, 0, 1)
+
+        # Convert to numpy array for display (H, W, C)
+        grid_np = grid.permute(1, 2, 0).cpu().numpy()
+
+        # Scale to [0, 255] and convert to uint8
+        grid_np = (grid_np * 255).astype(np.uint8)
+
+        # If the source tensor was RGB, convert to BGR for cv2 display
+        if not is_bgr:
+            grid_np = cv2.cvtColor(grid_np, cv2.COLOR_RGB2BGR)
+
+        # Display the image
+        logging.info("Displaying augmented images. Press any key in the window to exit.")
+        cv2.imshow('Data Check - Press any key to exit', grid_np)
+        cv2.waitKey(0)
+        logging.info("Data check complete. Exiting.")
+
+
 def main():
     parser = argparse.ArgumentParser(description='AdaFace Training (ImageFolder)')
     parser.add_argument('--data_dir', type=str, default='/home/ubuntu/KOR_DATA/high_resolution_train_data_640', help='Path to dataset root or root/imgs with class folders')
@@ -247,6 +313,7 @@ def main():
     parser.add_argument('--pretrained', action='store_true' , help='pretrained')
     parser.add_argument('--pretrained_path', type=str, default='', help='Path to pretrained AdaFace ckpt')
     parser.add_argument('--save_all', action='store_true')
+    parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
 
     # AdaFace head params
     parser.add_argument('--head', type=str, default='adaface', choices=['adaface','arcface','cosface'])
@@ -256,10 +323,10 @@ def main():
     parser.add_argument('--t_alpha', type=float, default=0.01)
     
     # augmentations
-    parser.add_argument('--low_res_augmentation_prob', type=float, default=0.0)
-    parser.add_argument('--crop_augmentation_prob', type=float, default=0.0)
-    parser.add_argument('--photometric_augmentation_prob', type=float, default=0.0)
-    parser.add_argument('--swap_color_channel', action='store_true')
+    parser.add_argument('--low_res_augmentation_prob', type=float, default=0.05)
+    parser.add_argument('--crop_augmentation_prob', type=float, default=0)
+    parser.add_argument('--photometric_augmentation_prob', type=float, default=0.05)
+    parser.add_argument('--swap_color_channel', default=True)
 
     parser.add_argument('--img_size', type=int, default=112, help='Input image size (height and width)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
@@ -310,6 +377,9 @@ def main():
         img_size=args.img_size,
         seed=args.seed,
     )
+
+
+    data_check(train_loader, is_bgr=args.swap_color_channel)
 
 
     adaface_head = head_lib.build_head(
