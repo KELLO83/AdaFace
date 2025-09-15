@@ -9,13 +9,15 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
+from tqdm import tqdm
+from torch.cuda import amp
+import torchvision.transforms.v2 as v2
 
 import net
 import head as head_lib
 from dataset.image_folder_dataset import CustomImageFolderDataset
 
 from utils.polynomialLRWarmup import PolynomialLRWarmup
-import torchvision.transforms.v2 as v2
 
 def split_parameters(module: nn.Module) -> Tuple[list, list]:
     params_decay = []
@@ -40,8 +42,7 @@ def build_dataloaders(data_dir: str,
                       output_dir: str,
                       img_size: int = 112) -> Tuple[DataLoader, DataLoader, int]:
 
-    img_size = img_size
-
+    # AdaFace normalization expects mean=0.5, std=0.5 on BGR-order images (dataset does BGR swap)
     train_transform = v2.Compose([
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
@@ -128,48 +129,62 @@ def build_dataloaders(data_dir: str,
 
 def load_pretrained_backbone(model: nn.Module, ckpt_path: str):
     ckpt = torch.load(ckpt_path, map_location='cpu')
-    state = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
-    model_state = {k.replace('model.', ''): v for k, v in state.items() if 'model.' in k or k in model.state_dict()}
-    result = model.load_state_dict(model_state, strict=False)
+    state = ckpt.get('state_dict', ckpt)
+    model_sd = model.state_dict()
+
+    filtered = {}
+    for k, v in state.items():
+        k2 = k[6:] if k.startswith('model.') else k
+        if k2 in model_sd and model_sd[k2].shape == v.shape:
+            filtered[k2] = v
+
+    result = model.load_state_dict(filtered, strict=False)
     print(f"Loaded pretrained backbone from {ckpt_path}")
-    print(f"Missing keys: {result.missing_keys}")
-    print(f"Unexpected keys: {result.unexpected_keys}")
+    print(f"Loaded keys: {len(filtered)} | Missing: {len(result.missing_keys)} | Unexpected: {len(result.unexpected_keys)}")
 
 
-def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device):
+def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device, scaler: amp.GradScaler, epoch_idx: int, total_epochs: int, use_amp: bool = True):
     backbone.train()
     adaface_head.train()
     running_loss = 0.0
     correct = 0
     total = 0
-    for images, labels in loader:
+    pbar = tqdm(loader, total=len(loader), desc=f"Train {epoch_idx+1}/{total_epochs}")
+    for images, labels in pbar:
         images = images.to(device)
         labels = labels.to(device)
+        optimizer.zero_grad(set_to_none=True)
 
-        optimizer.zero_grad()
-        out = backbone(images)
-        if isinstance(out, (tuple, list)):
-            embeddings, norms = out
-        else:
-            raw = out
-            norms = torch.norm(raw, p=2, dim=1, keepdim=True)
-            embeddings = raw / norms
-        logits = adaface_head(embeddings, norms, labels)
-        loss = criterion(logits, labels)
+        with amp.autocast(enabled=use_amp):
+            out = backbone(images)
+            if isinstance(out, (tuple, list)):
+                embeddings, norms = out
+            else:
+                raw = out
+                norms = torch.norm(raw, p=2, dim=1, keepdim=True)
+                embeddings = raw / norms
+            logits = adaface_head(embeddings, norms, labels)
+            loss = criterion(logits, labels)
 
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += loss.item() * images.size(0)
         _, preds = torch.max(logits, 1)
         total += labels.size(0)
         correct += (preds == labels).sum().item()
 
+        pbar.set_postfix({
+            'loss': f"{(running_loss/max(total,1)):.4f}",
+            'acc': f"{(100.0*correct/max(total,1)):.2f}%"
+        })
+
     return running_loss / total, correct / total
 
 
 @torch.no_grad()
-def evaluate(backbone, adaface_head, loader, criterion, device):
+def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = True):
     if loader is None:
         return 0.0, 0.0
     backbone.eval()
@@ -180,15 +195,16 @@ def evaluate(backbone, adaface_head, loader, criterion, device):
     for images, labels in loader:
         images = images.to(device)
         labels = labels.to(device)
-        out = backbone(images)
-        if isinstance(out, (tuple, list)):
-            embeddings, norms = out
-        else:
-            raw = out
-            norms = torch.norm(raw, p=2, dim=1, keepdim=True)
-            embeddings = raw / norms
-        logits = adaface_head(embeddings, norms, labels)
-        loss = criterion(logits, labels)
+        with amp.autocast(enabled=use_amp):
+            out = backbone(images)
+            if isinstance(out, (tuple, list)):
+                embeddings, norms = out
+            else:
+                raw = out
+                norms = torch.norm(raw, p=2, dim=1, keepdim=True)
+                embeddings = raw / norms
+            logits = adaface_head(embeddings, norms, labels)
+            loss = criterion(logits, labels)
         running_loss += loss.item() * images.size(0)
         _, preds = torch.max(logits, 1)
         total += labels.size(0)
@@ -241,10 +257,27 @@ def main():
         photo_aug=args.photometric_augmentation_prob,
         swap_color=args.swap_color_channel,
         output_dir=args.output_dir,
+        img_size=args.img_size,
     )
 
     # Model + Head
-    backbone = net.build_model(args.arch).to(device)
+    # build backbone with dynamic input size (supported: 112 or 224)
+    assert args.img_size in [112, 224], 'img_size must be 112 or 224 to match backbone shapes'
+
+    def build_backbone_with_size(arch: str, img_size: int):
+        if arch == 'ir_18':
+            return net.IR_18((img_size, img_size))
+        if arch == 'ir_34':
+            return net.IR_34((img_size, img_size))
+        if arch == 'ir_50':
+            return net.IR_50((img_size, img_size))
+        if arch == 'ir_101':
+            return net.IR_101((img_size, img_size))
+        if arch == 'ir_se_50':
+            return net.IR_SE_50((img_size, img_size))
+        raise ValueError(f'Unsupported arch: {arch}')
+
+    backbone = build_backbone_with_size(args.arch, args.img_size).to(device)
     if args.start_from_model_statedict:
         load_pretrained_backbone(backbone, args.start_from_model_statedict)
 
@@ -273,9 +306,11 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     best_acc = 0.0
+    scaler = amp.GradScaler(enabled=(device.type == 'cuda'))
+    use_amp = device.type == 'cuda'
     for epoch in range(args.epochs):
-        train_loss, train_acc = train_one_epoch(backbone, adaface_head, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device)
+        train_loss, train_acc = train_one_epoch(backbone, adaface_head, train_loader, criterion, optimizer, device, scaler, epoch, args.epochs, use_amp=use_amp)
+        val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device, use_amp=use_amp)
         scheduler.step()
 
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss {train_loss:.4f} Acc {train_acc*100:.2f}% | Val Loss {val_loss:.4f} Acc {val_acc*100:.2f}%")
