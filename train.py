@@ -55,7 +55,7 @@ def build_dataloaders(data_dir: str,
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
         v2.Resize((img_size, img_size)), 
-        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02),
+        v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0),
         v2.RandomHorizontalFlip(p=0.5),
          v2.RandomApply([v2.RandomAffine(
                 degrees=5,
@@ -149,13 +149,44 @@ def build_dataloaders(data_dir: str,
 def load_pretrained_backbone(model: nn.Module, ckpt_path: str):
     ckpt = torch.load(ckpt_path, map_location='cpu')
 
-    load_result = model.load_state_dict({key.replace('model.', ''):val
-                                            for key,val in ckpt['state_dict'].items() if 'model.' in key},
-                                        strict=False)
+    state_dict = None
+    if isinstance(ckpt, dict):
+        if 'backbone' in ckpt:
+            state_dict = ckpt['backbone']
+            logging.info("Loading weights from 'backbone' key in checkpoint.")
+
+        elif 'state_dict' in ckpt:
+            raw_sd = ckpt['state_dict']
+            if any(k.startswith('model.') for k in raw_sd.keys()):
+                state_dict = {k.replace('model.', ''): v for k, v in raw_sd.items() if k.startswith('model.')}
+                logging.info("Loading weights from 'state_dict' key and removing 'model.' prefix.")
+            else:
+                state_dict = raw_sd
+                logging.info("Loading weights from 'state_dict' key.")
+        elif all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+                state_dict = ckpt
+                logging.info("Loading weights from a raw state dictionary checkpoint.")
+        else:
+            raise RuntimeError(f"Unsupported checkpoint format. Keys found: {list(ckpt.keys())}")
+        
+    elif isinstance(ckpt, (dict, OrderedDict)):
+            state_dict = ckpt
+            logging.info("Loading weights from a raw state dictionary file.")
+    else:
+        raise RuntimeError(f"Unsupported checkpoint file type: {type(ckpt)}")
+
+    if state_dict is None:
+        raise RuntimeError("Could not find a valid state dictionary to load.")
+
+    result = model.load_state_dict(state_dict, strict=False)
     
-    result = model.load_state_dict(load_result, strict=False)
     logging.info(f"Loaded pretrained backbone from {ckpt_path}")
-    logging.info(f"Loaded keys: {len(load_result)} | Missing: {len(result.missing_keys)} | Unexpected: {len(result.unexpected_keys)}")
+    logging.info(f"-> Missing keys: {len(result.missing_keys)}")
+    if result.missing_keys:
+        logging.info(f"   (Examples: {result.missing_keys[:5]})")
+    logging.info(f"-> Unexpected keys: {len(result.unexpected_keys)}")
+    if result.unexpected_keys:
+        logging.info(f"   (Examples: {result.unexpected_keys[:5]})")
 
 
 def weight_freeze(model: nn.Module):
@@ -163,25 +194,25 @@ def weight_freeze(model: nn.Module):
     for param in model.parameters():
         param.requires_grad = False
 
-    # Determine the index of the last block in the body
+    unfrozen_layers = []
+    
     last_block_idx = -1
     if hasattr(model, 'body') and isinstance(model.body, nn.Sequential):
         last_block_idx = len(model.body) - 1
-    
-    unfrozen_layers = []
+
+    unfreeze_targets = ['output_layer'] 
+    if last_block_idx != -1:
+        for sub_layer_idx in [3, 4, 5]:
+            unfreeze_targets.append(f'body.{last_block_idx}.res_layer.{sub_layer_idx}')
+
 
     for name, param in model.named_parameters():
-        # Unfreeze the output layer
-        if name.startswith('output_layer'):
+        if any(name.startswith(target) for target in unfreeze_targets):
             param.requires_grad = True
-            if 'output_layer' not in unfrozen_layers:
-                unfrozen_layers.append('output_layer')
-        
-        # Unfreeze the last block of the body
-        if last_block_idx != -1 and name.startswith(f'body.{last_block_idx}'):
-            param.requires_grad = True
-            if f'body.{last_block_idx}' not in unfrozen_layers:
-                unfrozen_layers.append(f'body.{last_block_idx}')
+            
+            base_name = '.'.join(name.split('.')[:4]) if name.startswith('body') else 'output_layer'
+            if base_name not in unfrozen_layers:
+                unfrozen_layers.append(base_name)
 
     backbone_params = sum(p.numel() for p in model.parameters())
     trainable_backbone_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -293,11 +324,14 @@ def data_check(loader: DataLoader, is_bgr: bool):
             grid_np = cv2.cvtColor(grid_np, cv2.COLOR_RGB2BGR)
 
         # Display the image
-        logging.info("Displaying augmented images. Press any key in the window to exit.")
         cv2.imshow('Data Check - Press any key to exit', grid_np)
-        cv2.waitKey(0)
-        logging.info("Data check complete. Exiting.")
-
+        key = cv2.waitKey(0)
+        if key == 27:
+            logging.info("ESC key pressed. Exiting data check.")
+            break
+    
+    exit(0)
+        
 
 def main():
     parser = argparse.ArgumentParser(description='AdaFace Training (ImageFolder)')
@@ -314,6 +348,10 @@ def main():
     parser.add_argument('--pretrained_path', type=str, default='', help='Path to pretrained AdaFace ckpt')
     parser.add_argument('--save_all', action='store_true')
     parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
+
+    # W&B related arguments
+    parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & Biases logging.')
+    parser.add_argument('--wandb_name', type=str, default='adaface_ir101', help='Name for the W&B run.')
 
     # AdaFace head params
     parser.add_argument('--head', type=str, default='adaface', choices=['adaface','arcface','cosface'])
@@ -378,9 +416,10 @@ def main():
         seed=args.seed,
     )
 
-
-    data_check(train_loader, is_bgr=args.swap_color_channel)
-
+    # --- Data Check ---
+    if args.data_check:
+        data_check(train_loader, is_bgr=args.swap_color_channel)
+        return  # Exit after checking
 
     adaface_head = head_lib.build_head(
         head_type=args.head,
@@ -392,6 +431,18 @@ def main():
         s=args.s,
     ).to(device)
 
+    # --- W&B Initialization ---
+    if args.use_wandb:
+        import wandb
+        wandb.init(
+            project="AdaFace",
+            name=args.wandb_name,
+            config=args
+        )
+
+    if args.use_wandb:
+        logging.info("Watching models with W&B.")
+        wandb.watch((backbone, adaface_head), log='all', log_freq=100)
 
 
     paras_wo_bn, paras_only_bn = split_parameters(backbone)
@@ -418,6 +469,18 @@ def main():
 
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss {train_loss:.4f} Acc {train_acc*100:.2f}% | Val Loss {val_loss:.4f} Acc {val_acc*100:.2f}%")
 
+        # --- W&B Logging ---
+        if args.use_wandb:
+            current_lr = optimizer.param_groups[0]['lr']
+            wandb.log({
+                'epoch': epoch + 1,
+                'train_loss': train_loss,
+                'train_acc': train_acc,
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+                'learning_rate': current_lr
+            })
+
         # Save checkpoints
         state = {
             'epoch': epoch + 1,
@@ -433,6 +496,10 @@ def main():
         if val_loader is not None and val_acc > best_acc:
             best_acc = val_acc
             torch.save(state, os.path.join(args.output_dir, 'best.ckpt'))
+
+    # --- W&B Finish ---
+    if args.use_wandb:
+        wandb.finish()
 
 
 if __name__ == '__main__':
