@@ -487,7 +487,7 @@ def parser():
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
     parser.add_argument('--pretrained', action='store_true' , help='pretrained')
-    parser.add_argument('--pretrained_path', type=str, default='', help='Path to pretrained AdaFace ckpt')
+    parser.add_argument('--pretrained_path', type=str, default='adaface_ir101_webface12m.ckpt', help='Path to pretrained AdaFace ckpt')
     parser.add_argument('--num_unfreeze_blocks', type=int, default=4, help='Number of final blocks to unfreeze for fine-tuning.')
     parser.add_argument('--save_all', action='store_true')
     parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
