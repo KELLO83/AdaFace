@@ -192,7 +192,7 @@ def load_pretrained_backbone(model: nn.Module, ckpt_path: str):
         logging.info(f"   (Examples: {result.unexpected_keys[:5]})")
 
 
-def weight_freeze(model: nn.Module):
+def weight_freeze(model: nn.Module, num_unfreeze_blocks: int = 3):
 
     for param in model.parameters():
         param.requires_grad = False
@@ -204,23 +204,28 @@ def weight_freeze(model: nn.Module):
         last_block_idx = len(model.body) - 1
 
     unfreeze_targets = ['output_layer'] 
-    if last_block_idx != -1:
-        for sub_layer_idx in [3, 4, 5]:
-            unfreeze_targets.append(f'body.{last_block_idx}.res_layer.{sub_layer_idx}')
+    if last_block_idx != -1 and num_unfreeze_blocks > 0:
+        start_idx = max(0, last_block_idx - num_unfreeze_blocks + 1)
+        for block_idx in range(start_idx, last_block_idx + 1):
+            unfreeze_targets.append(f'body.{block_idx}')
 
 
     for name, param in model.named_parameters():
         if any(name.startswith(target) for target in unfreeze_targets):
             param.requires_grad = True
             
-            base_name = '.'.join(name.split('.')[:4]) if name.startswith('body') else 'output_layer'
+            if name.startswith('body'):
+                base_name = '.'.join(name.split('.')[:2]) # e.g. body.46
+            else:
+                base_name = 'output_layer'
+
             if base_name not in unfrozen_layers:
                 unfrozen_layers.append(base_name)
 
     backbone_params = sum(p.numel() for p in model.parameters())
     trainable_backbone_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logging.info('==' * 30)
-    logging.info(f"Unfrozen layers: {', '.join(unfrozen_layers)}")
+    logging.info(f"Unfrozen layers: {', '.join(sorted(unfrozen_layers))}")
     logging.info(f"Model total params: {backbone_params:,}")
     logging.info(f"Model trainable params: {trainable_backbone_params:,}")
     logging.info(f"Trainable params percentage: {100 * trainable_backbone_params / backbone_params:.2f}%")
@@ -363,7 +368,7 @@ def main(args):
     if args.pretrained :
         if args.pretrained_path and os.path.isfile(args.pretrained_path):
             load_pretrained_backbone(backbone, args.pretrained_path)
-            weight_freeze(backbone)
+            weight_freeze(backbone, args.num_unfreeze_blocks)
         else:
             print(f"{args.pretrained_path} is not a file. Starting from scratch.")
 
@@ -483,6 +488,7 @@ def parser():
     parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
     parser.add_argument('--pretrained', action='store_true' , help='pretrained')
     parser.add_argument('--pretrained_path', type=str, default='', help='Path to pretrained AdaFace ckpt')
+    parser.add_argument('--num_unfreeze_blocks', type=int, default=3, help='Number of final blocks to unfreeze for fine-tuning.')
     parser.add_argument('--save_all', action='store_true')
     parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
 
