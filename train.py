@@ -23,6 +23,8 @@ import head as head_lib
 from dataset.image_folder_dataset import CustomImageFolderDataset
 
 from utils.polynomialLRWarmup import PolynomialLRWarmup
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 import logging
 
 def split_parameters(module: nn.Module) -> Tuple[list, list]:
@@ -163,6 +165,7 @@ def load_pretrained_backbone(model: nn.Module, ckpt_path: str):
             else:
                 state_dict = raw_sd
                 logging.info("Loading weights from 'state_dict' key.")
+                
         elif all(isinstance(v, torch.Tensor) for v in ckpt.values()):
                 state_dict = ckpt
                 logging.info("Loading weights from a raw state dictionary checkpoint.")
@@ -236,7 +239,7 @@ def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device
         labels = labels.to(device)
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast(device_type=device.type):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             out = backbone(images)
             if isinstance(out, (tuple, list)):
                 embeddings, norms = out
@@ -278,7 +281,7 @@ def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = 
     for images, labels in loader:
         images = images.to(device)
         labels = labels.to(device)
-        with torch.amp.autocast(device_type=device.type):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             out = backbone(images)
             if isinstance(out, (tuple, list)):
                 embeddings, norms = out
@@ -333,43 +336,7 @@ def data_check(loader: DataLoader, is_bgr: bool):
     exit(0)
         
 
-def main():
-    parser = argparse.ArgumentParser(description='AdaFace Training (ImageFolder)')
-    parser.add_argument('--data_dir', type=str, default='/home/ubuntu/KOR_DATA/high_resolution_train_data_640', help='Path to dataset root or root/imgs with class folders')
-    parser.add_argument('--output_dir', type=str, default='experiments/adaface_custom', help='Output directory')
-    parser.add_argument('--arch', type=str, default='ir_101', choices=['ir_18','ir_34','ir_50','ir_101','ir_se_50'], help='Backbone architecture')
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--num_workers', type=int, default=os.cpu_count())
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=5e-4)
-    parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
-    parser.add_argument('--pretrained', action='store_true' , help='pretrained')
-    parser.add_argument('--pretrained_path', type=str, default='', help='Path to pretrained AdaFace ckpt')
-    parser.add_argument('--save_all', action='store_true')
-    parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
-
-    # W&B related arguments
-    parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & Biases logging.')
-    parser.add_argument('--wandb_name', type=str, default='adaface_ir101', help='Name for the W&B run.')
-
-    # AdaFace head params
-    parser.add_argument('--head', type=str, default='adaface', choices=['adaface','arcface','cosface'])
-    parser.add_argument('--m', type=float, default=0.4)
-    parser.add_argument('--h', type=float, default=0.333)
-    parser.add_argument('--s', type=float, default=64.0)
-    parser.add_argument('--t_alpha', type=float, default=0.01)
-    
-    # augmentations
-    parser.add_argument('--low_res_augmentation_prob', type=float, default=0.05)
-    parser.add_argument('--crop_augmentation_prob', type=float, default=0)
-    parser.add_argument('--photometric_augmentation_prob', type=float, default=0.05)
-    parser.add_argument('--swap_color_channel', default=True)
-
-    parser.add_argument('--img_size', type=int, default=112, help='Input image size (height and width)')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
-
-    args = parser.parse_args()
+def main(args):
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     os.makedirs(args.output_dir, exist_ok=True)
@@ -396,10 +363,9 @@ def main():
     if args.pretrained :
         if args.pretrained_path and os.path.isfile(args.pretrained_path):
             load_pretrained_backbone(backbone, args.pretrained_path)
+            weight_freeze(backbone)
         else:
             print(f"{args.pretrained_path} is not a file. Starting from scratch.")
-
-    weight_freeze(backbone)
 
     # Data
     train_loader, val_loader, class_num = build_dataloaders(
@@ -452,9 +418,11 @@ def main():
     ], lr=args.lr, weight_decay=0.0)
 
 
-    scheduler = PolynomialLRWarmup(
-        optimizer, warmup_iters=10, total_iters=args.epochs, power=1.0 , limit_lr = 1e-5
-    )
+    # scheduler = PolynomialLRWarmup(
+    #     optimizer, warmup_iters=10, total_iters=args.epochs, power=1.0 , limit_lr = 1e-5
+    # )
+
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2)
 
     criterion = nn.CrossEntropyLoss()
 
@@ -502,5 +470,50 @@ def main():
         wandb.finish()
 
 
+def parser():
+    parser = argparse.ArgumentParser(description='AdaFace Training (ImageFolder)')
+    parser.add_argument('--data_dir', type=str, default='/home/ubuntu/KOR_DATA/high_resolution_train_data_640', help='Path to dataset root or root/imgs with class folders')
+    parser.add_argument('--output_dir', type=str, default='experiments', help='Output directory')
+    parser.add_argument('--arch', type=str, default='ir_101', choices=['ir_18','ir_34','ir_50','ir_101','ir_se_50'], help='Backbone architecture')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--num_workers', type=int, default=os.cpu_count())
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
+    parser.add_argument('--pretrained', action='store_true' , help='pretrained')
+    parser.add_argument('--pretrained_path', type=str, default='', help='Path to pretrained AdaFace ckpt')
+    parser.add_argument('--save_all', action='store_true')
+    parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
+
+    # W&B related arguments
+    parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & Biases logging.')
+    parser.add_argument('--wandb_name', type=str, default='adaface_ir101', help='Name for the W&B run.')
+
+    # AdaFace head params
+    parser.add_argument('--head', type=str, default='adaface', choices=['adaface','arcface','cosface'])
+    parser.add_argument('--m', type=float, default=0.4)
+    parser.add_argument('--h', type=float, default=0.333)
+    parser.add_argument('--s', type=float, default=64.0)
+    parser.add_argument('--t_alpha', type=float, default=0.01)
+    
+    # augmentations
+    parser.add_argument('--low_res_augmentation_prob', type=float, default=0.05)
+    parser.add_argument('--crop_augmentation_prob', type=float, default=0)
+    parser.add_argument('--photometric_augmentation_prob', type=float, default=0.05)
+    parser.add_argument('--swap_color_channel', default=True)
+
+    parser.add_argument('--img_size', type=int, default=112, help='Input image size (height and width)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+
+    parser.set_defaults(
+        pretrained = True,
+    )
+
+    
+    args = parser.parse_args()
+    return args
+
 if __name__ == '__main__':
-    main()
+    args = parser()
+    main(args)
