@@ -14,7 +14,7 @@ for name , param in backbone.named_parameters():
     param.requires_grad = False
 
 for name , param in backbone.named_parameters():
-    if name.startswith('body.48') or name.startswith('body.47') or name.startswith('body.46') or name.startswith('body.45'):
+    if name.startswith('body.48') or name.startswith('body.47') or name.startswith('body.46') or name.startswith('body.45') or name.startswith('body.44'):
         param.requires_grad = True
 
 # for name , param in backbone.named_parameters():
@@ -39,3 +39,6 @@ print("누락된 가중치 : {}".format(load_result.missing_keys))
 print("예상치못한 가중치 : {}".format(load_result.unexpected_keys))
 print(load_result)
 print("="*30)
+
+for name , param in backbone.named_parameters():
+    print(f"name: {name}, requires_grad: {param.requires_grad}")
