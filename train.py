@@ -275,7 +275,7 @@ def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device
 
 
 @torch.no_grad()
-def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = True):
+def evaluate(backbone, adaface_head, loader, criterion, device, epoch_idx: int, total_epochs: int, use_amp: bool = True):
     if loader is None:
         return 0.0, 0.0
     backbone.eval()
@@ -283,7 +283,8 @@ def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = 
     running_loss = 0.0
     correct = 0
     total = 0
-    for images, labels in loader:
+    pbar = tqdm(loader, total=len(loader), desc=f"Val {epoch_idx+1}/{total_epochs}")
+    for images, labels in pbar:
         images = images.to(device)
         labels = labels.to(device)
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
@@ -300,6 +301,11 @@ def evaluate(backbone, adaface_head, loader, criterion, device, use_amp: bool = 
         _, preds = torch.max(logits, 1)
         total += labels.size(0)
         correct += (preds == labels).sum().item()
+
+        pbar.set_postfix({
+            'loss': f"{(running_loss/max(total,1)):.4f}",
+            'acc': f"{(100.0*correct/max(total,1)):.2f}%"
+        })
     return running_loss / total, correct / total
 
 
@@ -437,7 +443,7 @@ def main(args):
     use_amp = device.type == 'cuda'
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(backbone, adaface_head, train_loader, criterion, optimizer, device, scaler, epoch, args.epochs, use_amp=use_amp)
-        val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device, use_amp=use_amp)
+                val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device, epoch, args.epochs, use_amp=use_amp)
         scheduler.step()
 
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss {train_loss:.4f} Acc {train_acc*100:.2f}% | Val Loss {val_loss:.4f} Acc {val_acc*100:.2f}%")
@@ -478,7 +484,7 @@ def main(args):
 def parser():
     parser = argparse.ArgumentParser(description='AdaFace Training (ImageFolder)')
     parser.add_argument('--data_dir', type=str, default='/home/ubuntu/Downloads/train_high', help='Path to dataset root or root/imgs with class folders')
-    parser.add_argument('--output_dir', type=str, default='experiments', help='Output directory')
+    parser.add_argument('--output_dir', type=str, default='checkpoints', help='Output directory')
     parser.add_argument('--arch', type=str, default='ir_101', choices=['ir_18','ir_34','ir_50','ir_101','ir_se_50'], help='Backbone architecture')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=2048)
