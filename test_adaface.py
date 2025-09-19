@@ -123,6 +123,97 @@ def build_eval_transform(img_size: int) -> v2.Compose:
         v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
+
+def render_evaluation_plots(
+    fpr: np.ndarray,
+    tpr: np.ndarray,
+    roc_auc: float,
+    eer: float,
+    eer_index: int,
+    eer_threshold: float,
+    scores: np.ndarray,
+    labels: np.ndarray,
+    cm: np.ndarray,
+    output_path: str,
+) -> None:
+    """Save ROC, similarity histogram, and confusion matrix plots as a single figure."""
+    scores = np.asarray(scores, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int32)
+    cm = np.asarray(cm, dtype=np.int32)
+
+    positive_scores = scores[labels == 1]
+    negative_scores = scores[labels == 0]
+
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(1, 3, 1)
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    if 0 <= eer_index < len(fpr):
+        plt.scatter(fpr[eer_index], tpr[eer_index], color='red', s=80, zorder=5, label=f'EER = {eer:.4f}')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate (FAR)')
+    plt.ylabel('True Positive Rate (TPR)')
+    plt.title('ROC Curve')
+    plt.legend(loc="lower right")
+    plt.grid(True)
+
+    plt.subplot(1, 3, 2)
+    if positive_scores.size:
+        plt.hist(
+            positive_scores,
+            bins=30,
+            alpha=0.7,
+            color='green',
+            label=f'Same Person (n={len(positive_scores)})',
+            density=True,
+        )
+    if negative_scores.size:
+        plt.hist(
+            negative_scores,
+            bins=30,
+            alpha=0.7,
+            color='red',
+            label=f'Different Person (n={len(negative_scores)})',
+            density=True,
+        )
+    plt.axvline(eer_threshold, color='black', linestyle='--', linewidth=2, label=f'EER Threshold: {eer_threshold:.3f}')
+    plt.xlabel('Cosine Similarity')
+    plt.ylabel('Density')
+    plt.title('Similarity Distribution')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1, 3, 3)
+    cm_sum = cm.sum(axis=1, keepdims=True)
+    cm_normalized = np.divide(cm.astype(np.float64), cm_sum, out=np.zeros_like(cm, dtype=np.float64), where=cm_sum != 0)
+    im = plt.imshow(cm_normalized, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title('Normalized Confusion Matrix')
+    plt.colorbar(im)
+    classes = ['Different Person', 'Same Person']
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45)
+    plt.yticks(tick_marks, classes)
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        value = cm[i, j] if i < cm.shape[0] and j < cm.shape[1] else 0
+        percentage = cm_normalized[i, j] if i < cm_normalized.shape[0] and j < cm_normalized.shape[1] else 0.0
+        plt.text(
+            j,
+            i,
+            f'{value}\n({percentage:.2%})',
+            ha="center",
+            va="center",
+            color="white" if percentage > 0.5 else "black",
+        )
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logging.info("평가 시각화 이미지를 저장했습니다: %s", output_path)
+
 class Dataset_load(Dataset):
     def __init__(self, identity_map, transform):
         super().__init__()
@@ -820,8 +911,8 @@ def main(args):
     
 
 
-    scores = np.concatenate([pos_similarities, neg_similarities])
-    labels = np.concatenate([pos_labels, neg_labels])
+    scores = np.concatenate([pos_similarities, neg_similarities]).astype(np.float32)
+    labels = np.concatenate([pos_labels, neg_labels]).astype(np.int32)
 
     del pos_similarities , neg_similarities , pos_labels , neg_labels
     gc.collect()
@@ -839,7 +930,7 @@ def main(args):
         tar_at_far_results = {far: np.interp(far, fpr, tpr) for far in args.target_fars}
         
         predictions = (scores >= eer_threshold).astype(int)
-        cm = confusion_matrix(labels, predictions)
+        cm = confusion_matrix(labels, predictions, labels=[0, 1])
         
         tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0,0,0,0)
 
@@ -855,6 +946,10 @@ def main(args):
         for far, tar in tar_at_far_results.items():
             print(f"  - TAR @ FAR {far*100:g}%: {tar:.4f}")
         
+        plot_output_path = os.path.join(script_dir, f"{args.model}_face_recognition_evaluation.png")
+        render_evaluation_plots(fpr, tpr, roc_auc, eer, eer_index, eer_threshold, scores, labels, cm, plot_output_path)
+        print(f"평가 시각화 이미지가 '{plot_output_path}'에 저장되었습니다.")
+
         with open(LOG_FILE, 'a') as log_file:
             log_file.write(f"\n평가 결과:\n")
             log_file.write(f"전체 클래스수  : {NUM_FOLDER_TO_PROCESS}  전체 사람 이미지수 : {TOTAL_IMAGE_LEN}\n")
