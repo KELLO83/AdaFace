@@ -558,6 +558,7 @@ def parser():
 
     parser.set_defaults(
         pretrained = True,
+        use_wandb = True
     )
 
     
