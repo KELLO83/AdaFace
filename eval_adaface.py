@@ -1,24 +1,26 @@
 import os
 import itertools
 import random
-import numpy as np
-import pandas as pd
-import torch
-import cv2
-from tqdm import tqdm
-from sklearn.metrics import roc_curve, auc, confusion_matrix
-import logging
-import argparse
-import matplotlib.pyplot as plt
-import logging
-import torchvision.transforms.v2 as v2
-import numpy as np
-from multiprocessing import Process, Queue 
-from datetime import datetime
-from torch.utils.data import Dataset , DataLoader
 import gc
 import time
 import sys
+import logging
+import argparse
+from collections import OrderedDict
+from datetime import datetime
+from multiprocessing import Process, Queue
+from typing import Tuple
+
+import cv2
+import matplotlib.pyplot as plt
+import net
+import numpy as np
+import pandas as pd
+import torch
+import torchvision.transforms.v2 as v2
+from sklearn.metrics import roc_curve, auc, confusion_matrix
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,17 +30,104 @@ except NameError:
 print(f"script dir ---> {script_dir}")
 print(f"python version {sys.version}")
 
+
+SUPPORTED_BACKBONES = {
+    'ir_18': net.IR_18,
+    'ir_34': net.IR_34,
+    'ir_50': net.IR_50,
+    'ir_101': net.IR_101,
+    'ir_se_50': net.IR_SE_50,
+}
+
+MODEL_REGISTRY = {
+    'adaface_ir101_webface12m': {
+        'arch': 'ir_101',
+        'img_size': 112,
+        'weight_path': os.path.join('experiments', 'best.ckpt'),
+    },
+    'adaface_ir101_webface4m': {
+        'arch': 'ir_101',
+        'img_size': 112,
+        'weight_path': None,
+    },
+    'adaface_ir101_ms1mv3': {
+        'arch': 'ir_101',
+        'img_size': 112,
+        'weight_path': None,
+    },
+    'adaface_ir50_casia': {
+        'arch': 'ir_50',
+        'img_size': 112,
+        'weight_path': None,
+    },
+}
+
+
+def build_backbone(arch: str, img_size: int) -> torch.nn.Module:
+    if arch not in SUPPORTED_BACKBONES:
+        raise ValueError(f"Unsupported backbone arch '{arch}'. Supported: {sorted(SUPPORTED_BACKBONES)}")
+    if img_size not in (112, 224):
+        raise ValueError("img_size must be 112 or 224")
+    constructor = SUPPORTED_BACKBONES[arch]
+    return constructor((img_size, img_size))
+
+
+def resolve_model_config(args) -> Tuple[str, int, str]:
+    model_cfg = MODEL_REGISTRY.get(args.model, {})
+    arch = args.arch or model_cfg.get('arch')
+    img_size = args.img_size or model_cfg.get('img_size', 112)
+    weight_path = args.weight_path or model_cfg.get('weight_path')
+
+    if arch is None:
+        raise ValueError("Backbone architecture is undefined. Pass --arch or register the model in MODEL_REGISTRY.")
+    return arch, img_size, weight_path
+
+
+def load_backbone_checkpoint(backbone: torch.nn.Module, ckpt_path: str, map_location='cpu'):
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location=map_location)
+    state_dict = None
+
+    if isinstance(ckpt, dict):
+        if 'backbone' in ckpt:
+            state_dict = ckpt['backbone']
+        elif 'state_dict' in ckpt:
+            raw = ckpt['state_dict']
+            if any(k.startswith('model.') for k in raw):
+                state_dict = {k.replace('model.', ''): v for k, v in raw.items() if k.startswith('model.')}
+            else:
+                state_dict = raw
+        elif all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            state_dict = ckpt
+    elif isinstance(ckpt, OrderedDict):
+        state_dict = ckpt
+
+    if state_dict is None:
+        raise RuntimeError(f"Unsupported checkpoint format: keys={list(ckpt)[:5]}")
+
+    load_result = backbone.load_state_dict(state_dict, strict=False)
+    logging.info("Backbone weights loaded from %s", ckpt_path)
+    logging.info("Missing keys: %s", load_result.missing_keys)
+    logging.info("Unexpected keys: %s", load_result.unexpected_keys)
+
+    return load_result
+
+
+def build_eval_transform(img_size: int) -> v2.Compose:
+    return v2.Compose([
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.CenterCrop(size=(img_size, img_size)),
+        v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
 class Dataset_load(Dataset):
-    def __init__(self, identity_map):
+    def __init__(self, identity_map, transform):
         super().__init__()
         self.all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values()))))
-
-        self.transform = v2.Compose([
-            v2.ToImage(), 
-            v2.ToDtype(torch.float32, scale=True),
-            v2.CenterCrop(size=(112, 112)),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        self.transform = transform
 
     def __len__(self):
         return len(self.all_images)
@@ -127,65 +216,63 @@ def init_worker(worker_embeddings):
     global embeddings
     embeddings = worker_embeddings
 
-transforms_v2 = v2.Compose([
-    v2.ToImage(), # cv2 HWC ---> Tensor C H W
-    v2.ToDtype(torch.float32, scale=True),
-    v2.CenterCrop(size=(112, 112)),
-    v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-])
-
 @torch.inference_mode()
-def get_all_embeddings(identity_map, backbone, batch_size):
-    
-    logging.info(f"임베딩 추출 시작 ( 배치사이즈: {batch_size})")
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    logging.info(f"현재 사용 장치: {device}")
-    logging.info(f"장치 타입: {device.type}")
+def get_all_embeddings(
+    identity_map,
+    backbone,
+    batch_size,
+    device,
+    img_size,
+    save_cache=False,
+    cache_name=None,
+):
+    logging.info("임베딩 추출 시작 (배치사이즈: %s)", batch_size)
+    logging.info("현재 사용 장치: %s", device)
 
     if device.type == 'cpu':
-        input("\nCPU 추론을 진행합니다. 계속하시려면 아무 키나 입력하세요...")
+        logging.warning("CPU inference detected. Expect slower embedding extraction.")
 
-    backbone = backbone.to(device)
     backbone.eval()
-    
-    embeddings = {} 
-    dataset = Dataset_load(identity_map)
+
+    transform = build_eval_transform(img_size)
+    dataset = Dataset_load(identity_map, transform)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=os.cpu_count(),
-        pin_memory=True, 
+        pin_memory=device.type == 'cuda',
     )
 
+    embeddings = {}
+    use_autocast = device.type == 'cuda'
+    autocast_dtype = torch.float16 if use_autocast else None
 
     for batch_tensor, batch_paths in tqdm(dataloader, desc='임베딩 추출'):
         if batch_tensor is None:
             continue
 
         batch_tensor = batch_tensor.to(device)
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+        with torch.amp.autocast(device_type=device.type, enabled=use_autocast, dtype=autocast_dtype):
             output = backbone(batch_tensor)
-            vectors = output[1] if isinstance(output, tuple) else output
-            
-        if vectors is not None and vectors.numel() > 0:
-            vectors_cpu = vectors.cpu()
-            for path, vector in zip(batch_paths, vectors_cpu):
-                embeddings[path] = vector.to(torch.float16).flatten()
+            vectors = output[0] if isinstance(output, (tuple, list)) else output
 
+        if vectors is None or vectors.numel() == 0:
+            continue
 
-    try:
-        if args.save_cache:
-            file_name = f'{args.model}.npz'
+        vectors_cpu = vectors.detach().cpu()
+        dtype = torch.float16 if use_autocast else torch.float32
+        for path, vector in zip(batch_paths, vectors_cpu):
+            embeddings[path] = vector.to(dtype).flatten()
+
+    if save_cache:
+        cache_filename = cache_name or 'embeddings_cache.npz'
+        try:
             embeddings_np = {k: v.cpu().numpy() for k, v in embeddings.items()}
-            np.savez_compressed(file_name, **embeddings_np)
-            logging.info(f"임베딩 캐시 저장완료 파일이름 : {file_name}")
-        
-    except Exception as e:
-        logging.info(f'{e}')
-        logging.info("@@임베딩 캐시 저장 실패 코드검수.....!!@@")
+            np.savez_compressed(cache_filename, **embeddings_np)
+            logging.info("임베딩 캐시 저장완료 파일이름 : %s", cache_filename)
+        except Exception as exc:
+            logging.error("임베딩 캐시 저장 실패: %s", exc)
 
     return embeddings
 
@@ -499,41 +586,38 @@ def main(args):
             logging.StreamHandler()
         ]
     )
-    
+    arch, img_size, weight_path = resolve_model_config(args)
+    backbone = build_backbone(arch, img_size)
 
-    from net import Backbone
-    if args.model =='adaface_ir101_webface12m':
-        Weight_path = 'experiments/best.ckpt'
-        if not os.path.isfile(Weight_path):
-            logging.error(f"모델 가중치 파일을 찾을 수 없습니다: {Weight_path}")
-            exit(1)
-        ckpt = torch.load(Weight_path, map_location='cpu')
-        backbone = Backbone([112,112], 100, 'ir')
+    if weight_path is None:
+        logging.warning("체크포인트 경로가 설정되지 않았습니다. --weight_path 로 직접 지정해주세요.")
+        if args.load_cache is None:
+            raise ValueError("가중치 없이 평가를 진행할 수 없습니다. --weight_path 또는 --load_cache 를 제공하세요.")
+    else:
+        load_backbone_checkpoint(backbone, weight_path, map_location='cpu')
 
+    if args.confirm:
+        flag = str(input("진행시 아무키... (1)종료..."))
+        if flag == '1':
+            logging.info("종료../")
+            exit(0)
 
-    load_result = backbone.load_state_dict({key.replace('model.', ''):val
-                                        for key,val in ckpt['state_dict'].items() if 'model.' in key})
-    
-    logging.info("누락된 가중치 : {}".format(load_result.missing_keys))
-    logging.info("예상치못한 가중치 : {}".format(load_result.unexpected_keys))
+    device = torch.device(args.device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        logging.warning("CUDA를 사용할 수 없습니다. CPU로 대체합니다.")
+        device = torch.device('cpu')
 
-
-    if not load_result.missing_keys and not load_result.unexpected_keys:
-        logging.info("모델 가중치가 성공적으로 로드되었습니다.")
-
-    flag = str(input("진행시 아무키... (1)종료..."))
-    if flag == '1':
-        logging.info("종료../")
-        exit(0)
-
-    MAX_BATCH_SIZE = find_max_batch_size(backbone , (3,112,112) , device = 'cuda' if torch.cuda.is_available() else 'cpu')
+    MAX_BATCH_SIZE = find_max_batch_size(backbone , (3,img_size,img_size) , device = device.type)
     gc.collect()
     torch.cuda.empty_cache()
     if MAX_BATCH_SIZE is not None:
         args.batch_size = MAX_BATCH_SIZE // 2
         logging.info(f"배치사이즈 변경(최대치) : {MAX_BATCH_SIZE // 2}")
 
-    backbone = torch.compile(backbone)
+    backbone = backbone.to(device)
+
+    if not args.no_compile and hasattr(torch, "compile"):
+        backbone = torch.compile(backbone)
 
 
     ALL_PERSON_FOLDERS = sorted(os.listdir(args.data_path))
@@ -572,7 +656,13 @@ def main(args):
 
     else:
         embeddings = get_all_embeddings(
-            identity_map, backbone ,args.batch_size
+            identity_map,
+            backbone,
+            args.batch_size,
+            device,
+            img_size,
+            save_cache=args.save_cache,
+            cache_name=args.cache_name or f"{args.model}.npz",
         )
 
     start_time = time.time()
@@ -777,19 +867,6 @@ def main(args):
             log_file.write(f"평가를 완료하였습니다 (종료시간) ---> {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}")
             log_file.write("\n")
 
-        excel_path = os.path.join(script_dir, args.excel_path)
-
-        try:
-            plot_roc_curve(fpr, tpr, roc_auc, args.model, excel_path)
-        except Exception as e:
-            logging.info(f"ROC Curve 이미지 저장 실패 {e}")
-
-        try:
-            save_results_to_excel(excel_path, args.model, roc_auc, eer, tar_at_far_results, \
-                              args.target_fars, metrics, total_dataset_img_len, total_class, args.data_path, args.model, \
-                              rank_1_accuracy, rank_5_accuracy)
-        except Exception as e:
-            logging.info(f"EXCEL SAVE 저장 실패 {e}")
 
         logging.info(f"평가를 완료하였습니다 (종료시간) ---> {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}")
 
@@ -798,72 +875,31 @@ def main(args):
         print(msg)
         logging.error(msg)
 
-def save_results_to_excel(excel_path, model_name, roc_auc, eer, tar_at_far_results, target_fars, metrics, total_dataset_img_len, total_class,
-                           data_path, model_attr_value, rank_1_accuracy=None, rank_5_accuracy=None):
 
-
-    new_data = {
-        "model_name": [model_name],
-        "roc_auc": [f"{roc_auc:.4f}"], "eer": [f"{eer:.4f}"],
-        "accuracy": [f"{metrics['accuracy']:.4f}"], "recall": [f"{metrics['recall']:.4f}"],
-        "f1_score": [f"{metrics['f1_score']:.4f}"], "tp": [metrics['tp']],
-        "tn": [metrics['tn']], "fp": [metrics['fp']], "fn": [metrics['fn']]
-    }
-
-    for far in target_fars:
-        new_data[f"tar_at_far_{far*100:g}%"] = [f"{tar_at_far_results.get(far, 0):.4f}"]
-
-    if rank_1_accuracy is not None:
-        new_data["rank_1_accuracy"] = [f"{rank_1_accuracy:.4f}"]
-    if rank_5_accuracy is not None:
-        new_data["rank_5_accuracy"] = [f"{rank_5_accuracy:.4f}"]
-
-    new_data.update({
-        'total_dataset_img_len': [total_dataset_img_len],
-        'total_class': [total_class],
-        'data_path': [data_path],
-        'model_attr': [model_attr_value]
-    })
-    
-    new_df = pd.DataFrame(new_data)
-    try:
-        df = pd.read_excel(excel_path)
-    except FileNotFoundError:
-        df = pd.DataFrame()
-
-    updated_df = pd.concat([df, new_df], ignore_index=True)
-    updated_df.to_excel(excel_path, index=False)
-    print(f"\n평가 결과가 '{excel_path}' 파일에 저장되었습니다.")
-
-def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
-    """ROC 커브를 그리고 파일로 저장합니다."""
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.4f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate (FAR)')
-    plt.ylabel('True Positive Rate (TAR)')
-    plt.title(f'ROC Curve {model_name}')
-    plt.legend(loc="lower right")
-    plt.grid(True)
-    plot_filename = os.path.splitext(excel_path)[0] + f"_{model_name}_roc_curve.png"
-    plt.savefig(plot_filename)
-    print(f"ROC 커브 그래프가 '{plot_filename}' 파일로 저장되었습니다.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='adaface_ir101_webface12m', choices=['adaface_ir101_webface12m' , 'adaface_ir101_webface4m','adaface_ir101_ms1mv3','adaface_ir50_casia'],)
+    parser = argparse.ArgumentParser(description="AdaFace Evaluation Script")
+    parser.add_argument('--model', type=str, default='adaface_ir101_webface12m',
+                        choices=list(MODEL_REGISTRY.keys()), help='사전 정의된 모델 이름')
+    parser.add_argument('--arch', type=str, default=None, choices=list(SUPPORTED_BACKBONES.keys()),
+                        help='백본 아키텍처 (MODEL_REGISTRY에 없거나 커스텀 가중치를 사용할 때 지정)')
+    parser.add_argument('--img_size', type=int, default=None, choices=[112, 224],
+                        help='입력 이미지 크기')
+    parser.add_argument('--weight_path', type=str, default=None, help='평가할 체크포인트 경로 (.ckpt, .pth 등)')
+    parser.add_argument('--no_compile', default = False , help='torch.compile 비활성화')
+
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/Downloads/test_high", help="평가할 데이터셋의 루트 폴더")
-    parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="사용할 장치 (예: cpu, cuda, cuda:0)")
-    parser.add_argument("--batch_size", type=int, default=2048, help="임베딩 추출 시 배치 크기")
-    parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
-    parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
+    parser.add_argument("--batch_size", type=int, default=1536, help="임베딩 추출 시 배치 크기")
+    parser.add_argument('--load_cache', type=str, default=None, help="임베딩 캐시경로")
+    parser.add_argument('--save_cache', action='store_true', help='임베딩을 NPZ 파일로 저장')
+    parser.add_argument('--cache_name', type=str, default=None, help='임베딩 캐시 파일 이름 (기본: <model>.npz)')
+    parser.add_argument('--split', default=1, type=int, help='전체 클래스 수 / N')
+    parser.add_argument('--confirm', action='store_true', help='실행 전 진행 여부를 확인하는 프롬프트 표시')
+
+    parser.set_defaults(confirm=True)
     args = parser.parse_args()
 
     
