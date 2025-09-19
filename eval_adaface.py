@@ -13,10 +13,12 @@ import matplotlib.pyplot as plt
 import logging
 import torchvision.transforms.v2 as v2
 import numpy as np
-from multiprocessing.pool import Pool
+from multiprocessing import Process, Queue 
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
+import time
+import sys
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +26,7 @@ except NameError:
     script_dir = os.getcwd()
 
 print(f"script dir ---> {script_dir}")
+print(f"python version {sys.version}")
 
 class Dataset_load(Dataset):
     def __init__(self, identity_map):
@@ -43,7 +46,7 @@ class Dataset_load(Dataset):
     def __getitem__(self, index):
         image_path = self.all_images[index]
         image = cv2.imread(image_path) # BGR순서로 읽음..
-        #image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB) # adaface 스킵
+        #image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
         image_tensor = self.transform(image)
         return image_tensor, image_path
     
@@ -186,26 +189,6 @@ def get_all_embeddings(identity_map, backbone, batch_size):
 
     return embeddings
 
-def _calculate_similarity_for_pair(pair):
-    global embeddings
-    img1_path, img2_path = pair
-    
-    emb1 = embeddings.get(img1_path)
-    emb2 = embeddings.get(img2_path)
-    
-    if emb1 is not None and emb2 is not None:
-        emb1 = emb1.to(torch.float32)
-        emb2 = emb2.to(torch.float32)
-
-        norm1 = torch.norm(emb1)
-        norm2 = torch.norm(emb2)
-
-        if norm1 > 0 and norm2 > 0:
-            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
-            return cosine_similarity.cpu().numpy().astype(np.float16)
-            
-    return None
-
 def calculate_identification_metrics(identity_map, embeddings):
     logging.info("Calculating identification metrics (Rank-k, CMC)...")
 
@@ -303,23 +286,201 @@ def calculate_identification_metrics(identity_map, embeddings):
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
-def generate_positive_pairs(identity_map):
-    """동일 인물 쌍을 생성하는 제너레이터"""
-    for imgs in identity_map.values():
-        for pair in itertools.combinations(imgs, 2):
-            yield pair
 
-def generate_negative_pairs(identity_map, num_pairs):
-    """다른 인물 쌍을 생성하는 제너레이터 (중복 허용)"""
+def generate_positive_pairs(identity_map, producer_id, num_producers):
+
+    identities = list(identity_map.values())
+    for i in range(producer_id, len(identities), num_producers):
+        imgs = identities[i]
+        if len(imgs) >= 2:
+            for pair in itertools.combinations(imgs, 2):
+                yield pair
+
+def generate_negative_pairs(identity_map, num_pairs, pid):
+    pid_seed = 42 + pid  
+    random.seed(pid_seed)
+    np.random.seed(pid_seed)
+    
     identities = list(identity_map.keys())
-    if len(identities) < 2:
-        return
-
     for _ in range(num_pairs):
-        id1, id2 = random.sample(identities, 2)
-        img1 = random.choice(identity_map[id1])
-        img2 = random.choice(identity_map[id2])
+        id1, id2 = random.sample(identities, 2)  
+        img1 = random.choice(identity_map[id1])   
+        img2 = random.choice(identity_map[id2])   
         yield (img1, img2)
+
+def producer_task_negative(queue, identity_map, chunk_size, num_pairs_to_generate , pid):
+    chunk = []
+    pair_generator = generate_negative_pairs(identity_map, num_pairs_to_generate , pid)
+
+    for pair in pair_generator:
+        chunk.append(pair)
+        if len(chunk) >= chunk_size:
+            queue.put(chunk)  
+            chunk = []
+
+    if chunk:
+        queue.put(chunk)
+
+def producer_task(queue, identity_map, chunk_size , producer_id , num_producers ):
+    chunk = []
+
+    pair_generator = generate_positive_pairs(identity_map , producer_id  , num_producers)
+
+    for pair in pair_generator:
+        chunk.append(pair)
+        if len(chunk) >= chunk_size:
+            queue.put(chunk)  
+            chunk = []
+
+    if chunk:
+        queue.put(chunk)
+
+
+def _calculate_similarity_for_pair_images(pair , embeddings):
+    img1_path, img2_path = pair
+    
+    emb1 = embeddings.get(img1_path)
+    emb2 = embeddings.get(img2_path)
+    
+    if emb1 is not None and emb2 is not None:
+        emb1 = emb1.to(torch.float32)
+        emb2 = emb2.to(torch.float32)
+
+        norm1 = torch.norm(emb1)
+        norm2 = torch.norm(emb2)
+
+        if norm1 > 0 and norm2 > 0:
+            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
+            return cosine_similarity.cpu().numpy().astype(np.float16)
+            
+    return None
+
+def writer_task(results_queue, output_file_path, total_pairs, description):
+    with open(output_file_path, 'wb') as f, tqdm(total=total_pairs, desc=description, unit='pair') as pbar:
+        while True:
+            results = results_queue.get()
+            if results is None:
+                break
+
+            if results:
+                np_results = np.array(results, dtype=np.float16)
+                np_results.tofile(f) 
+                f.flush() 
+                pbar.update(len(results))
+
+def consumer_task(work_queue, results_queue, embeddings , chunk_size = 10000):
+    buffer = []
+    buffer_size = chunk_size  
+    while True:
+        chunk = work_queue.get()
+        if chunk is None:
+            if buffer:
+                results_queue.put(buffer)
+            break
+        
+        for pair in chunk:
+            similarity = _calculate_similarity_for_pair_images(pair, embeddings)
+            if similarity is not None:
+                buffer.append(similarity)
+
+            if len(buffer) >= buffer_size:
+                results_queue.put(buffer)
+                buffer = [] 
+
+
+def process_similarities_with_multiproducer(identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir):
+
+    num_producers = 2
+    num_consumers = os.cpu_count() - num_producers
+
+    chunk_size = 5000 * 10
+    queue_size = 100000 * 10
+    
+    logging.info(f"다중 생산자-소비자 패턴 시작:")
+    logging.info(f"  - 생산자 프로세스: {num_producers}개")
+    logging.info(f"  - 소비자 프로세스: {num_consumers}개")
+    logging.info(f"  - 청크 크기: {chunk_size} ")
+    logging.info(f"  - 큐 크기: {queue_size}")
+    logging.info(f"  - 예상 총 처리량: Positive {num_positive_pairs}, Negative {num_negative_pairs}")
+    
+    pos_file_path = os.path.join(script_dir, 'similarity_for_pair.npy')
+    neg_file_path = os.path.join(script_dir, 'negative_for_pair.npy')
+
+    print("동일 인물 쌍 처리를 시작합니다.")
+    producer_process = []
+    consumer_process = []
+    data_queue = Queue()
+    result_queue = Queue()
+
+    for producer_id in range(num_producers):
+        p = Process(target=producer_task , args=(data_queue , identity_map , chunk_size , producer_id , num_producers))
+        producer_process.append(p)
+        p.start() 
+    
+    for _ in range(num_consumers):
+        c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings , chunk_size))
+        consumer_process.append(c)
+        c.start()
+
+    writer_pos = Process(target=writer_task, args=(result_queue, pos_file_path, num_positive_pairs, "동일 인물 쌍 처리"))
+    writer_pos.start()
+
+    for p in producer_process:
+        p.join()
+
+    for _ in range(num_consumers):
+        data_queue.put(None)
+
+    for c in consumer_process:
+        c.join()
+
+    result_queue.put(None)
+    writer_pos.join()
+    data_queue.close()
+    result_queue.close()
+    print("동일 인물 쌍 처리 완료.")
+
+    print("다른 인물 쌍 처리를 시작합니다.")
+
+    producer_process = []
+    consumer_process = []
+    data_queue = Queue()
+    result_queue = Queue()
+
+    total_neg_pairs = num_negative_pairs
+    neg_pairs_per_producer = total_neg_pairs // num_producers
+    
+    for producer_id in range(num_producers):
+        num_to_generate = neg_pairs_per_producer
+        if producer_id == num_producers - 1:
+
+            num_to_generate = total_neg_pairs - (neg_pairs_per_producer * (num_producers - 1))
+
+        p = Process(target=producer_task_negative , args=(data_queue , identity_map , chunk_size , num_to_generate , producer_id))
+        producer_process.append(p)
+        p.start()
+    
+    for _ in range(num_consumers):
+        c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings , chunk_size))
+        consumer_process.append(c)
+        c.start()
+
+    writer_neg = Process(target=writer_task, args=(result_queue, neg_file_path, num_negative_pairs, "다른 인물 쌍 처리"))
+    writer_neg.start()
+
+    for p in producer_process:
+        p.join()
+
+    for _ in range(num_consumers):
+        data_queue.put(None)
+
+    for c in consumer_process:
+        c.join()
+
+    result_queue.put(None)
+    writer_neg.join()
+    print("다른 인물 쌍 처리 완료.")
+
 
 def main(args):
     LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
@@ -339,33 +500,15 @@ def main(args):
         ]
     )
     
-    if not os.path.isdir(args.data_path):
-        raise FileNotFoundError(f"데이터셋 경로를 찾을 수 없습니다: {args.data_path}")
 
     from net import Backbone
     if args.model =='adaface_ir101_webface12m':
-        Weight_path = 'adaface_ir101_webface12m.ckpt'
+        Weight_path = 'experiments/best.ckpt'
+        if not os.path.isfile(Weight_path):
+            logging.error(f"모델 가중치 파일을 찾을 수 없습니다: {Weight_path}")
+            exit(1)
         ckpt = torch.load(Weight_path, map_location='cpu')
         backbone = Backbone([112,112], 100, 'ir')
-
-    elif args.model =='adaface_ir101_webface4m':
-        Weight_path = 'adaface_ir101_webface4m.ckpt'
-        ckpt = torch.load(Weight_path, map_location='cpu')
-        backbone = Backbone([112,112], 100, 'ir')
-
-    elif args.model =='adaface_ir101_ms1mv3':
-        Weight_path = 'adaface_ir101_ms1mv3.ckpt'
-        ckpt = torch.load(Weight_path, map_location='cpu')
-        backbone = Backbone([112,112], 100, 'ir')
-
-    elif args.model == 'adaface_ir50_casia':
-        Weight = 'adaface_ir50_casia.ckpt'
-        ckpt = torch.load(Weight, map_location='cpu')
-        backbone = Backbone([112,112],50,'ir')
-
-    else:
-        logging.info(f"Select Model {args.model}")
-        exit(0)
 
 
     load_result = backbone.load_state_dict({key.replace('model.', ''):val
@@ -373,6 +516,7 @@ def main(args):
     
     logging.info("누락된 가중치 : {}".format(load_result.missing_keys))
     logging.info("예상치못한 가중치 : {}".format(load_result.unexpected_keys))
+
 
     if not load_result.missing_keys and not load_result.unexpected_keys:
         logging.info("모델 가중치가 성공적으로 로드되었습니다.")
@@ -390,6 +534,7 @@ def main(args):
         logging.info(f"배치사이즈 변경(최대치) : {MAX_BATCH_SIZE // 2}")
 
     backbone = torch.compile(backbone)
+
 
     ALL_PERSON_FOLDERS = sorted(os.listdir(args.data_path))
     NUM_FOLDER_TO_PROCESS = len(ALL_PERSON_FOLDERS) // args.split
@@ -419,11 +564,8 @@ def main(args):
 
     logging.info(f"- 동일 인물 쌍 (Generator 생성..): {num_positive_pairs}개, 다른 인물 쌍 (Generator 생성..): {num_negative_pairs}개")
 
-    positive_pairs_generator = generate_positive_pairs(identity_map)
-    negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
 
-
-    if args.load_cache is not None :
+    if args.load_cache is not None : 
         cache_path = args.load_cache
         with np.load(cache_path) as loaded_npz:
             embeddings = {key: torch.from_numpy(loaded_npz[key]) for key in tqdm(loaded_npz.files , desc='임베딩 캐시 로딩..')}
@@ -433,28 +575,21 @@ def main(args):
             identity_map, backbone ,args.batch_size
         )
 
-
+    start_time = time.time()
     del backbone
     gc.collect()
     torch.cuda.empty_cache()
 
-    import time
-    start_time = time.time()
-    with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
-        with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
-            pos_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, positive_pairs_generator, chunksize=1000)
-            for result in tqdm(pos_results_gen, total=num_positive_pairs, desc="동일 인물 쌍 계산 및 저장"):
-                if result is not None:
-                    result.tofile(f)
+    process_similarities_with_multiproducer(
+        identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir
+    )
 
-        with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
-            neg_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, negative_pairs_generator, chunksize=1000)
-            for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장"):
-                if result is not None:
-                    result.tofile(f)
 
-    end_time = time.time() - start_time
-    logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
+    running_time = time.time() - start_time
+    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
+
+    with open(LOG_FILE ,'a') as log_file:
+        log_file.write(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
@@ -492,8 +627,11 @@ def main(args):
     num_total_embeddings = len(embeddings)
     num_valid_embeddings = sum(1 for v in embeddings.values() if v is not None)
     num_none_embeddings = sum(1 for v in embeddings.values() if v is None)
+    total_dataset_img_len = sum(len(v) for v in identity_map.values())
+    total_class = len(identity_map)
 
     del embeddings
+    del identity_map
     gc.collect()
 
     start_time = time.time()
@@ -552,7 +690,7 @@ def main(args):
 
 
         with open(LOG_FILE, 'a') as log_file:
-            log_file.write(f"\n--- 유사도 분포 분석 ---\n")  
+            log_file.write(f"\n--- 유사도 분포 분석 ---")  
             log_file.write(f"🔍 디버깅 정보:\n")          
             log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}\n")
             log_file.write(f"   - 유효한 임베딩 수: {num_valid_embeddings}\n")
@@ -640,8 +778,6 @@ def main(args):
             log_file.write("\n")
 
         excel_path = os.path.join(script_dir, args.excel_path)
-        total_dataset_img_len = sum(len(v) for v in identity_map.values())
-        total_class = len(identity_map)
 
         try:
             plot_roc_curve(fpr, tpr, roc_auc, args.model, excel_path)
@@ -720,18 +856,17 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
     parser.add_argument('--model',type=str , default='adaface_ir101_webface12m', choices=['adaface_ir101_webface12m' , 'adaface_ir101_webface4m','adaface_ir101_ms1mv3','adaface_ir50_casia'],)
-    parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
+    parser.add_argument("--data_path", type=str, default="/home/ubuntu/Downloads/test_high", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="사용할 장치 (예: cpu, cuda, cuda:0)")
-    parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
+    parser.add_argument("--batch_size", type=int, default=2048, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split', type= int ,default=1 , help='전체클래스수 / N ')
+    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
-    #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
-
+    
     for key , values in args.__dict__.items():
         print(f"key {key}  :  {values}")
 

@@ -443,7 +443,7 @@ def main(args):
     use_amp = device.type == 'cuda'
     for epoch in range(args.epochs):
         train_loss, train_acc = train_one_epoch(backbone, adaface_head, train_loader, criterion, optimizer, device, scaler, epoch, args.epochs, use_amp=use_amp)
-                val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device, epoch, args.epochs, use_amp=use_amp)
+        val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device, epoch, args.epochs, use_amp=use_amp)
         scheduler.step()
 
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss {train_loss:.4f} Acc {train_acc*100:.2f}% | Val Loss {val_loss:.4f} Acc {val_acc*100:.2f}%")
@@ -489,7 +489,7 @@ def parser():
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--num_workers', type=int, default=os.cpu_count())
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
     parser.add_argument('--pretrained', action='store_true' , help='pretrained')
