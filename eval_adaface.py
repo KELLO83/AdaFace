@@ -860,6 +860,10 @@ def main(args):
             log_file.write(f"전체 클래스수  : {NUM_FOLDER_TO_PROCESS}  전체 사람 이미지수 : {TOTAL_IMAGE_LEN}\n")
             log_file.write(f"ROC-AUC: {roc_auc:.4f}, EER: {eer:.4f} (Threshold: {eer_threshold:.4f})\n")
             log_file.write(f"Accuracy: {metrics['accuracy']:.4f}, Recall: {metrics['recall']:.4f}, F1-Score: {metrics['f1_score']:.4f}\n")
+            log_file.write(f"TP: {metrics['tp']}\n")
+            log_file.write(f"TN: {metrics['tn']}\n")
+            log_file.write(f"FP: {metrics['fp']}\n")
+            log_file.write(f"FN: {metrics['fn']}\n")
             for far, tar in tar_at_far_results.items():
                 log_file.write(f"TAR @ FAR {far*100:g}%: {tar:.4f}\n")
             log_file.write("\n")  
