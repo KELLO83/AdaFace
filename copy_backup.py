@@ -37,13 +37,6 @@ def split_parameters(module: nn.Module) -> Tuple[list, list]:
     return params_decay, params_no_decay
 
 
-def set_batchnorm_eval(module: nn.Module):
-    """Puts all BatchNorm layers into eval mode to freeze running stats."""
-    for m in module.modules():
-        if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
-            m.eval()
-
-
 def build_dataloaders(data_dir: str,
                       batch_size: int,
                       num_workers: int,
@@ -237,10 +230,8 @@ def weight_freeze(model: nn.Module, num_unfreeze_blocks: int = 3):
     logging.info('==' * 30)
 
 
-def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device, scaler: amp.GradScaler, epoch_idx: int, total_epochs: int, use_amp: bool = True, freeze_bn_stats: bool = False):
+def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device, scaler: amp.GradScaler, epoch_idx: int, total_epochs: int, use_amp: bool = True):
     backbone.train()
-    if freeze_bn_stats:
-        set_batchnorm_eval(backbone)
     adaface_head.train()
     running_loss = 0.0
     correct = 0
@@ -282,12 +273,10 @@ def train_one_epoch(backbone, adaface_head, loader, criterion, optimizer, device
 
 
 @torch.no_grad()
-def evaluate(backbone, adaface_head, loader, criterion, device, epoch_idx: int, total_epochs: int, use_amp: bool = True, freeze_bn_stats: bool = False):
+def evaluate(backbone, adaface_head, loader, criterion, device, epoch_idx: int, total_epochs: int, use_amp: bool = True):
     if loader is None:
         return 0.0, 0.0
     backbone.eval()
-    if freeze_bn_stats:
-        set_batchnorm_eval(backbone)
     adaface_head.eval()
     running_loss = 0.0
     correct = 0
@@ -379,35 +368,13 @@ def main(args):
             return net.IR_SE_50((img_size, img_size))
         raise ValueError(f'Unsupported arch: {arch}')
 
-    resume_state = None
     backbone = build_backbone_with_size(args.arch, args.img_size).to(device)
-
-    freeze_backbone = False
-
-    if args.pre_all:
-        if args.pretrained_path and os.path.isfile(args.pretrained_path):
-            resume_state = torch.load(args.pretrained_path, map_location='cpu')
-            logging.info(
-                "Resuming full training state from %s (epoch=%s)",
-                args.pretrained_path,
-                resume_state.get('epoch', 'unknown'),
-            )
-            freeze_backbone = True
-        else:
-            raise FileNotFoundError(f"{args.pretrained_path} is not a valid checkpoint for --pre_all")
-    elif args.pretrained:
+    if args.pretrained :
         if args.pretrained_path and os.path.isfile(args.pretrained_path):
             load_pretrained_backbone(backbone, args.pretrained_path)
-            freeze_backbone = True
+            weight_freeze(backbone, args.num_unfreeze_blocks)
         else:
             print(f"{args.pretrained_path} is not a file. Starting from scratch.")
-
-    if freeze_backbone:
-        weight_freeze(backbone, args.num_unfreeze_blocks)
-
-    if args.freeze_bn_stats:
-        logging.info("Freezing BatchNorm running statistics (layers forced to eval mode).")
-        set_batchnorm_eval(backbone)
 
     # Data
     train_loader, val_loader, class_num = build_dataloaders(
@@ -438,40 +405,6 @@ def main(args):
         t_alpha=args.t_alpha,
         s=args.s,
     ).to(device)
-
-    start_epoch = 0
-    best_acc = 0.0
-
-    if resume_state is not None:
-        required_keys = {'backbone', 'head'}
-        missing_keys = required_keys.difference(resume_state.keys())
-        if missing_keys:
-            raise KeyError(f"Checkpoint is missing required keys for --pre_all: {missing_keys}")
-
-        ckpt_class_num = resume_state.get('class_num')
-        if ckpt_class_num is not None and ckpt_class_num != class_num:
-            raise ValueError(
-                f"Checkpoint class_num={ckpt_class_num} does not match dataset class_num={class_num}."
-            )
-
-        missing_backbone = backbone.load_state_dict(resume_state['backbone'], strict=True)
-        if missing_backbone.missing_keys or missing_backbone.unexpected_keys:
-            logging.warning(
-                "Backbone state dict mismatch when resuming. Missing=%s, Unexpected=%s",
-                missing_backbone.missing_keys,
-                missing_backbone.unexpected_keys,
-            )
-
-        missing_head = adaface_head.load_state_dict(resume_state['head'], strict=True)
-        if missing_head.missing_keys or missing_head.unexpected_keys:
-            logging.warning(
-                "Head state dict mismatch when resuming. Missing=%s, Unexpected=%s",
-                missing_head.missing_keys,
-                missing_head.unexpected_keys,
-            )
-
-        start_epoch = resume_state.get('epoch', 0)
-        best_acc = resume_state.get('best_acc', 0.0)
 
     # --- W&B Initialization ---
     if args.use_wandb:
@@ -536,30 +469,13 @@ def main(args):
 
     criterion = nn.CrossEntropyLoss()
 
+    best_acc = 0.0
     scaler = torch.amp.GradScaler()
 
-    if resume_state is not None:
-        if 'optimizer' not in resume_state or 'scheduler' not in resume_state:
-            raise KeyError("Checkpoint missing optimizer/scheduler state required for --pre_all resume.")
-
-        optimizer.load_state_dict(resume_state['optimizer'])
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
-
-        scheduler.load_state_dict(resume_state['scheduler'])
-
-        if 'scaler' in resume_state:
-            try:
-                scaler.load_state_dict(resume_state['scaler'])
-            except Exception as exc:
-                logging.warning("Failed to load AMP scaler state: %s", exc)
-
     use_amp = device.type == 'cuda'
-    for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_one_epoch(backbone, adaface_head, train_loader, criterion, optimizer, device, scaler, epoch, args.epochs, use_amp=use_amp, freeze_bn_stats=args.freeze_bn_stats)
-        val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device, epoch, args.epochs, use_amp=use_amp, freeze_bn_stats=args.freeze_bn_stats)
+    for epoch in range(args.epochs):
+        train_loss, train_acc = train_one_epoch(backbone, adaface_head, train_loader, criterion, optimizer, device, scaler, epoch, args.epochs, use_amp=use_amp)
+        val_loss, val_acc = evaluate(backbone, adaface_head, val_loader, criterion, device, epoch, args.epochs, use_amp=use_amp)
         scheduler.step()
 
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss {train_loss:.4f} Acc {train_acc*100:.2f}% | Val Loss {val_loss:.4f} Acc {val_acc*100:.2f}%")
@@ -577,11 +493,6 @@ def main(args):
                 **lr_logs,
             })
 
-        improved = False
-        if val_loader is not None and val_acc > best_acc:
-            best_acc = val_acc
-            improved = True
-
         # Save checkpoints
         state = {
             'epoch': epoch + 1,
@@ -589,14 +500,13 @@ def main(args):
             'head': adaface_head.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'scaler': scaler.state_dict(),
-            'best_acc': best_acc,
             'class_num': class_num,
         }
         if args.save_all or (epoch + 1 == args.epochs) or epoch % 3 ==0:
             torch.save(state, os.path.join(args.output_dir, f'epoch_{epoch+1}.ckpt'))
 
-        if improved:
+        if val_loader is not None and val_acc > best_acc:
+            best_acc = val_acc
             torch.save(state, os.path.join(args.output_dir, 'best.ckpt'))
 
     # --- W&B Finish ---
@@ -607,7 +517,7 @@ def main(args):
 def parser():
     parser = argparse.ArgumentParser(description='AdaFace Training (ImageFolder)')
     parser.add_argument('--data_dir', type=str, default='/home/ubuntu/Downloads/train_high', help='Path to dataset root or root/imgs with class folders')
-    parser.add_argument('--output_dir', type=str, default='checkpoints_block2_nothat', help='Output directory')
+    parser.add_argument('--output_dir', type=str, default='checkpoints', help='Output directory')
     parser.add_argument('--arch', type=str, default='ir_101', choices=['ir_18','ir_34','ir_50','ir_101','ir_se_50'], help='Backbone architecture')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=2048)
@@ -621,16 +531,14 @@ def parser():
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
     parser.add_argument('--pretrained', action='store_true' , help='pretrained')
-    parser.add_argument('--pre_all', action='store_true', help='Load full training state (model + optimizer + scheduler) to resume training.')
     parser.add_argument('--pretrained_path', type=str, default='adaface_ir101_webface12m.ckpt', help='Path to pretrained AdaFace ckpt')
     parser.add_argument('--num_unfreeze_blocks', type=int, default=2, help='Number of final blocks to unfreeze for fine-tuning.')
     parser.add_argument('--save_all', action='store_true')
     parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
-    parser.add_argument('--freeze_bn_stats', action='store_true', help='Keep BatchNorm layers in eval mode to freeze running statistics during fine-tuning.')
 
     # W&B related arguments
     parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & Biases logging.')
-    parser.add_argument('--wandb_name', type=str, default='adaface_ir101_not_hat_block2', help='Name for the W&B run.')
+    parser.add_argument('--wandb_name', type=str, default='adaface_ir101', help='Name for the W&B run.')
 
     # AdaFace head params
     parser.add_argument('--head', type=str, default='adaface', choices=['adaface','arcface','cosface'])
@@ -650,8 +558,7 @@ def parser():
 
     parser.set_defaults(
         pretrained = True,
-        use_wandb = True,
-        freeze_bn_stats = True
+        use_wandb = True
     )
 
     

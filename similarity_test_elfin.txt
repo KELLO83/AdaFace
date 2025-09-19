@@ -4,36 +4,36 @@ Positive samples: 850
 Negative samples: 850
 
 --- Performance ---
-ROC-AUC: 0.8352
-EER: 0.2541 (threshold 0.3510)
-Accuracy: 0.7459
-Precision: 0.7459
-Recall (TPR): 0.7459
-Specificity (TNR): 0.7459
-F1-Score: 0.7459
-FAR: 0.2541
-FRR: 0.2541
+ROC-AUC: 0.8831
+EER: 0.2047 (threshold 0.9132)
+Accuracy: 0.7953
+Precision: 0.7953
+Recall (TPR): 0.7953
+Specificity (TNR): 0.7953
+F1-Score: 0.7953
+FAR: 0.2047
+FRR: 0.2047
 
 --- Confusion Matrix ---
-TP: 634
-TN: 634
-FP: 216
-FN: 216
+TP: 676
+TN: 676
+FP: 174
+FN: 174
 
 --- Positive similarity stats ---
-min: 0.1008
-p10: 0.2569
-median: 0.4440
-p90: 0.5905
-max: 0.8549
-mean: 0.4385
-std: 0.1296
+min: 0.8426
+p10: 0.9023
+median: 0.9312
+p90: 0.9533
+max: 0.9855
+mean: 0.9294
+std: 0.0204
 
 --- Negative similarity stats ---
-min: -0.2038
-p10: -0.0102
-median: 0.2249
-p90: 0.4535
-max: 0.6387
-mean: 0.2198
-std: 0.1741
+min: 0.7899
+p10: 0.8450
+median: 0.8889
+p90: 0.9244
+max: 0.9666
+mean: 0.8863
+std: 0.0303

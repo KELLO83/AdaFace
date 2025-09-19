@@ -339,7 +339,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model', type=str, default='adaface_ir101_webface12m', choices=list(MODEL_REGISTRY.keys()), help='Predefined model configuration to use')
     parser.add_argument('--arch', type=str, default=None, choices=list(SUPPORTED_BACKBONES.keys()), help='Override backbone architecture')
     parser.add_argument('--img_size', type=int, default=112, choices=[112, 224], help='Override input image size')
-    parser.add_argument('--weight_path', type=str, default='best.ckpt', help='Checkpoint file to load')
+    parser.add_argument('--weight_path', type=str, default='best_adabn_lora_merged.ckpt', help='Checkpoint file to load')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device for inference (e.g. cpu, cuda, cuda:0)')
     parser.add_argument('--reference', type=str, default=None, help='(옵션) 기본값은 frr_detected/0.jpg 참조 이미지입니다.')
     parser.add_argument('--positive_glob', type=str, default='frr_detected/*.jpg', help='Glob pattern for positive samples (same identity)')
