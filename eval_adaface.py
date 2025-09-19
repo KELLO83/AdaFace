@@ -119,7 +119,7 @@ def build_eval_transform(img_size: int) -> v2.Compose:
     return v2.Compose([
         v2.ToImage(),
         v2.ToDtype(torch.float32, scale=True),
-        v2.CenterCrop(size=(img_size, img_size)),
+        v2.Resize((img_size, img_size)),
         v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
 
@@ -134,8 +134,7 @@ class Dataset_load(Dataset):
     
     def __getitem__(self, index):
         image_path = self.all_images[index]
-        image = cv2.imread(image_path) # BGR순서로 읽음..
-        #image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
+        image = cv2.imread(image_path) 
         image_tensor = self.transform(image)
         return image_tensor, image_path
     
