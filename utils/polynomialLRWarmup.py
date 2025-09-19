@@ -19,28 +19,40 @@ class PolynomialLRWarmup(_LRScheduler):
         if self.last_epoch == 0 or self.last_epoch > self.total_iters:
             return [group["lr"] for group in self.optimizer.param_groups]
 
-        if self.last_epoch <= self.warmup_iters:
+        if self.warmup_iters > 0 and self.last_epoch <= self.warmup_iters:
             return [base_lr * self.last_epoch / self.warmup_iters for base_lr in self.base_lrs]
+        elif self.total_iters == self.warmup_iters:
+            return [max(self.limit_lr, group["lr"]) if self.limit_lr is not None else group["lr"] for group in self.optimizer.param_groups]
         else:        
             l = self.last_epoch
             w = self.warmup_iters
             t = self.total_iters
             decay_factor = ((1.0 - (l - w) / (t - w)) / (1.0 - (l - 1 - w) / (t - w))) ** self.power
 
-        return [group["lr"] * decay_factor for group in self.optimizer.param_groups]
+        new_lrs = []
+        for group in self.optimizer.param_groups:
+            updated_lr = group["lr"] * decay_factor
+            if self.limit_lr is not None:
+                updated_lr = max(updated_lr, self.limit_lr)
+            new_lrs.append(updated_lr)
+        return new_lrs
 
     def _get_closed_form_lr(self):
 
-        if self.last_epoch <= self.warmup_iters:
+        if self.warmup_iters > 0 and self.last_epoch <= self.warmup_iters:
             return [
                 base_lr * self.last_epoch / self.warmup_iters for base_lr in self.base_lrs]
+        elif self.total_iters == self.warmup_iters:
+            return [max(self.limit_lr, base_lr) if self.limit_lr is not None else base_lr for base_lr in self.base_lrs]
         else:
-            return [
-                (
-                    base_lr * (1.0 - (min(self.total_iters, self.last_epoch) - self.warmup_iters) / (self.total_iters - self.warmup_iters)) ** self.power
-                )
-                for base_lr in self.base_lrs
-            ]
+            closed_form_lrs = []
+            for base_lr in self.base_lrs:
+                progress = (min(self.total_iters, self.last_epoch) - self.warmup_iters) / (self.total_iters - self.warmup_iters)
+                updated_lr = base_lr * (1.0 - progress) ** self.power
+                if self.limit_lr is not None:
+                    updated_lr = max(updated_lr, self.limit_lr)
+                closed_form_lrs.append(updated_lr)
+            return closed_form_lrs
 
 
 

@@ -338,10 +338,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Elfin face verification test harness')
     parser.add_argument('--model', type=str, default='adaface_ir101_webface12m', choices=list(MODEL_REGISTRY.keys()), help='Predefined model configuration to use')
     parser.add_argument('--arch', type=str, default=None, choices=list(SUPPORTED_BACKBONES.keys()), help='Override backbone architecture')
-    parser.add_argument('--img_size', type=int, default=None, choices=[112, 224], help='Override input image size')
-    parser.add_argument('--weight_path', type=str, default=None, help='Checkpoint file to load')
+    parser.add_argument('--img_size', type=int, default=112, choices=[112, 224], help='Override input image size')
+    parser.add_argument('--weight_path', type=str, default='best.ckpt', help='Checkpoint file to load')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device for inference (e.g. cpu, cuda, cuda:0)')
-    parser.add_argument('--reference', type=str, default=None, help='Reference image path. Defaults to the first positive sample.')
+    parser.add_argument('--reference', type=str, default=None, help='(옵션) 기본값은 frr_detected/0.jpg 참조 이미지입니다.')
     parser.add_argument('--positive_glob', type=str, default='frr_detected/*.jpg', help='Glob pattern for positive samples (same identity)')
     parser.add_argument('--negative_glob', type=str, default='far_detected/*.jpg', help='Glob pattern for negative samples (different identity)')
     parser.add_argument('--report_path', type=str, default='similarity_test_elfin.txt', help='Where to store the text report (set empty to skip)')
@@ -349,7 +349,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--log_level', type=str, default='INFO', help='Logging level (DEBUG, INFO, WARNING, ERROR)')
     parser.add_argument('--no_compile', action='store_true', help='Disable torch.compile')
     parser.add_argument('--dry_run', action='store_true', help='Skip heavy plotting/report generation (for smoke tests)')
-    return parser.parse_args()
+
+    args = parser.parse_args()
+    return args
 
 
 def main(args: argparse.Namespace) -> None:
@@ -364,9 +366,14 @@ def main(args: argparse.Namespace) -> None:
     if not negative_paths:
         raise ValueError(f"No negative images found for pattern: {args.negative_glob}")
 
-    reference_path = args.reference or positive_paths[0]
-    if reference_path in positive_paths:
-        positive_paths = [p for p in positive_paths if p != reference_path]
+    reference_path = os.path.join('frr_detected', '0.jpg')
+    if args.reference and os.path.abspath(args.reference) != os.path.abspath(reference_path):
+        logging.warning("--reference 옵션은 무시됩니다. 기본 참조 이미지(%s)를 사용합니다.", reference_path)
+    if not os.path.isfile(reference_path):
+        raise FileNotFoundError(f"Reference image not found: {reference_path}")
+
+    # Exclude the reference image from positive samples even if the glob picked it up
+    positive_paths = [p for p in positive_paths if os.path.abspath(p) != os.path.abspath(reference_path)]
 
     logging.info("Reference image: %s", reference_path)
     logging.info("Positive samples: %d", len(positive_paths))

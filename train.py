@@ -6,7 +6,6 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from tqdm import tqdm
@@ -23,7 +22,6 @@ import head as head_lib
 from dataset.image_folder_dataset import CustomImageFolderDataset
 
 from utils.polynomialLRWarmup import PolynomialLRWarmup
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import logging
 
@@ -423,17 +421,51 @@ def main(args):
 
 
     paras_wo_bn, paras_only_bn = split_parameters(backbone)
-    optimizer = optim.AdamW([
-        {'params': paras_wo_bn + [adaface_head.kernel], 'weight_decay': args.weight_decay},
-        {'params': paras_only_bn , 'weight_decay': 0.0}
-    ], lr=args.lr, weight_decay=0.0)
+
+    backbone_lr = args.backbone_lr if args.backbone_lr is not None else args.lr
+    head_lr = args.head_lr if args.head_lr is not None else args.lr
+
+    if args.backbone_lr is not None or args.head_lr is not None:
+        logging.info("Using differentiated learning rates – backbone: %.2e, head: %.2e", backbone_lr, head_lr)
+
+    backbone_param_list = [p for p in paras_wo_bn if p.requires_grad]
+    backbone_bn_param_list = [p for p in paras_only_bn if p.requires_grad]
+    head_param_list = [p for p in adaface_head.parameters() if p.requires_grad]
+
+    param_groups = []
+    if backbone_param_list:
+        param_groups.append({'params': backbone_param_list, 'weight_decay': args.weight_decay, 'lr': backbone_lr})
+    if backbone_bn_param_list:
+        param_groups.append({'params': backbone_bn_param_list, 'weight_decay': 0.0, 'lr': backbone_lr})
+    if head_param_list:
+        param_groups.append({'params': head_param_list, 'weight_decay': args.weight_decay, 'lr': head_lr})
+
+    if not param_groups:
+        raise RuntimeError("No trainable parameters were found. Check freezing settings and optimizer configuration.")
+
+    optimizer = optim.AdamW(param_groups, weight_decay=0.0)
 
 
-    # scheduler = PolynomialLRWarmup(
-    #     optimizer, warmup_iters=10, total_iters=args.epochs, power=1.0 , limit_lr = 1e-5
-    # )
+    # Configure polynomial warmup schedule (default: gentle 5-epoch warmup, power decay)
+    if args.epochs <= 1:
+        warmup_epochs = 0
+    else:
+        warmup_epochs = max(1, min(args.warmup_epochs, args.epochs - 1))
 
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2)
+    scheduler = PolynomialLRWarmup(
+        optimizer,
+        warmup_iters=warmup_epochs,
+        total_iters=args.epochs,
+        power=args.poly_power,
+        limit_lr=args.poly_min_lr,
+    )
+    logging.info(
+        "Polynomial LR warmup enabled (warmup_epochs=%d, total_epochs=%d, power=%.2f, min_lr=%.2e)",
+        warmup_epochs,
+        args.epochs,
+        args.poly_power,
+        args.poly_min_lr,
+    )
 
     criterion = nn.CrossEntropyLoss()
 
@@ -450,14 +482,15 @@ def main(args):
 
         # --- W&B Logging ---
         if args.use_wandb:
-            current_lr = optimizer.param_groups[0]['lr']
+            lr_logs = {f'lr_group_{idx}': group['lr'] for idx, group in enumerate(optimizer.param_groups)}
             wandb.log({
                 'epoch': epoch + 1,
                 'train_loss': train_loss,
                 'train_acc': train_acc,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
-                'learning_rate': current_lr
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                **lr_logs,
             })
 
         # Save checkpoints
@@ -490,11 +523,16 @@ def parser():
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--num_workers', type=int, default=os.cpu_count())
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--backbone_lr', type=float, default=1e-5, help='Optional override for backbone learning rate (defaults to --lr).')
+    parser.add_argument('--head_lr', type=float, default=1e-4, help='Optional override for head learning rate (defaults to --lr).')
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup phase length (in epochs) for polynomial LR schedule.')
+    parser.add_argument('--poly_power', type=float, default=2.0, help='Power factor for polynomial LR decay (higher = steeper decay).')
+    parser.add_argument('--poly_min_lr', type=float, default=1e-6, help='Target minimum learning rate as training completes.')
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--val_split', type=float, default=0.2, help='Fraction for validation split from training set')
     parser.add_argument('--pretrained', action='store_true' , help='pretrained')
-    parser.add_argument('--pretrained_path', type=str, default='experiments/best.ckpt', help='Path to pretrained AdaFace ckpt')
-    parser.add_argument('--num_unfreeze_blocks', type=int, default=4, help='Number of final blocks to unfreeze for fine-tuning.')
+    parser.add_argument('--pretrained_path', type=str, default='adaface_ir101_webface12m.ckpt', help='Path to pretrained AdaFace ckpt')
+    parser.add_argument('--num_unfreeze_blocks', type=int, default=2, help='Number of final blocks to unfreeze for fine-tuning.')
     parser.add_argument('--save_all', action='store_true')
     parser.add_argument('--data_check', action='store_true', help='Run data loader check and exit.')
 

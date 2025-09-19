@@ -1,0 +1,39 @@
+Reference image: frr_detected/0.jpg
+Total samples: 1700
+Positive samples: 850
+Negative samples: 850
+
+--- Performance ---
+ROC-AUC: 0.8352
+EER: 0.2541 (threshold 0.3510)
+Accuracy: 0.7459
+Precision: 0.7459
+Recall (TPR): 0.7459
+Specificity (TNR): 0.7459
+F1-Score: 0.7459
+FAR: 0.2541
+FRR: 0.2541
+
+--- Confusion Matrix ---
+TP: 634
+TN: 634
+FP: 216
+FN: 216
+
+--- Positive similarity stats ---
+min: 0.1008
+p10: 0.2569
+median: 0.4440
+p90: 0.5905
+max: 0.8549
+mean: 0.4385
+std: 0.1296
+
+--- Negative similarity stats ---
+min: -0.2038
+p10: -0.0102
+median: 0.2249
+p90: 0.4535
+max: 0.6387
+mean: 0.2198
+std: 0.1741
